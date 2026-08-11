@@ -305,7 +305,8 @@ run_bisync() {
     --transfers "$RCLONE_TRANSFERS"
     --checkers "$RCLONE_CHECKERS"
     --fast-list
-    --stats 0
+    --stats 1m
+    --stats-one-line
     --log-level INFO
     --log-file "$run_log"
     $EXTRA_RCLONE_FLAGS

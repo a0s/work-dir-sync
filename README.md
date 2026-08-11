@@ -105,6 +105,11 @@ bash sync.sh --once          # one-off sync without the daemon
 files that actually moved; the rest of rclone's per-cycle chatter is hidden
 behind `--raw`.
 
+A run in progress is reported as `syncing now — 1.2 GiB / 3.4 GiB, 35%, ...`:
+during a long initial upload the bisync listing and the shared log are only
+written at the end, so without that line the dashboard looks frozen and the two
+sides look permanently out of sync.
+
 `--tail` on its own is a live dashboard: it walks the cursor back over its own
 block and redraws it, so nothing that was in the terminal before is cleared and
 the last frame stays on screen after Ctrl-C. Combined with `--logs` it follows

@@ -211,10 +211,37 @@ render_overview() {
       fi
     fi
 
+    # A run in progress holds a lock file naming its PID; while it lasts the
+    # listing and the shared log stay untouched, which used to look like a stall.
+    run_log="$STATE_DIR/last-run-$key.log"
+    lock="$(ls "$STATE_DIR/bisync/"*"$key".lck 2>/dev/null | head -1)"
+    running_pid=""
+    if [ -n "$lock" ]; then
+      running_pid="$(sed -n 's/.*"PID":"\([0-9]*\)".*/\1/p' "$lock")"
+      kill -0 "$running_pid" 2>/dev/null || running_pid=""
+    fi
+
+    if [ -n "$running_pid" ]; then
+      started="$(head -1 "$run_log" 2>/dev/null | awk '{print $1, $2}')"
+      started_epoch="$(date -j -f '%Y/%m/%d %H:%M:%S' "$started" +%s 2>/dev/null || echo 0)"
+      # rclone's periodic one-line stats are the cheapest honest progress report
+      progress="$(tail -c 65536 "$run_log" 2>/dev/null |
+                  grep -E '[0-9]+%' | tail -1 | sed -E 's/^[0-9\/]+ [0-9:]+ [A-Z]+ *: *//')"
+      if [ -n "$progress" ]; then
+        row "syncing" "${BLUE}now${OFF} — $progress (started $(ago "$started_epoch"))"
+      else
+        row "syncing" "${BLUE}now${OFF} — building listings (started $(ago "$started_epoch"))"
+      fi
+    fi
+
     baseline="${RED}no baseline${OFF} (first resync pending)"
     [ -f "$STATE_DIR/resync-$key.done" ] && baseline="baseline ok"
 
-    row "state" "$verdict · last sync $(ago "$last_sync") · $baseline"
+    if [ -n "$running_pid" ]; then
+      row "state" "$verdict while syncing · previous sync $(ago "$last_sync") · $baseline"
+    else
+      row "state" "$verdict · last sync $(ago "$last_sync") · $baseline"
+    fi
 
     if [ -f "$STATE_DIR/failures-$key" ]; then
       row "failures" "${YELLOW}$(cat "$STATE_DIR/failures-$key") consecutive$OFF"
