@@ -1,5 +1,14 @@
 # work-dir-sync
 
+> ## ⚠️ Discontinued
+>
+> **This project is closed and no longer maintained.** It was retired on
+> 2026-08-12 after it failed at the job it was actually needed for: keeping two
+> Macs in sync through an SSH server. Both agents have been uninstalled, the
+> remote account and its data removed. The code stays up as a record of what was
+> measured — see [Postmortem](#postmortem) at the bottom for the numbers and for
+> what to use instead.
+
 Continuous **two-way** sync between local folders and a remote — object storage
 (Cloudflare R2, S3, B2…) or **your own server over SSH** — running as a user
 launchd agent.
@@ -277,3 +286,50 @@ the log instead.
 
 To force a clean baseline for a pair, delete its marker and let the daemon
 resync: `rm ~/.local/state/work-dir-sync/resync-<pair>.done`.
+
+## Postmortem
+
+Against Cloudflare R2 this worked. Against an SSH server holding two folders of
+git working copies — 320k files, 8 GB, 80 ms away — it did not, and the reason
+is architectural rather than a bug worth fixing.
+
+**Everything is per-file, and every file costs several round trips.** SFTP needs
+`stat` → `open` → `write` → `close` → `setstat` for each file. At 80 ms that is
+~0.4 s per file, and no amount of bandwidth helps — the link itself was measured
+at 29 MB/s and was never the constraint.
+
+**Parallelism does not rescue it.** Measured on 200 identical 8 KB files:
+
+| mode | files/sec |
+| --- | --- |
+| external `ssh=`, `--transfers 4` | 8.7 |
+| external `ssh=`, `--transfers 4` + checksum | 8.8 |
+| rclone's built-in SFTP client, `--transfers 4` | 8.2 |
+| built-in client, `--transfers 32` | 9.9 |
+| external `ssh=`, `--transfers 32` | 11.3 |
+
+Raising `--transfers` eightfold bought ~30%. `sshd -T` explains it: `MaxSessions
+10` caps concurrent channels on the multiplexed connection, `MaxStartups 10:30:100`
+caps separate ones, and the box has one core. The server itself was never the
+bottleneck — it creates the same 200 files locally in 0.17 s (1176 files/sec).
+
+**Comparing by content is worse than it looks.** With `ssh=`, rclone runs one
+`ssh … md5sum <file>` per file: 222 logins for 213 files, measured. For
+a0s_github's 228k files that is ~1.3 hours *per listing cycle*, so
+`SFTP_COMPARE` had to be dropped back to `size,modtime` — which reopens the
+silent-drift hole that checksums were added to close.
+
+**What actually worked: not using per-file transfer at all.** `tar | ssh | tar`
+moved 228k files / 5.8 GB in 9m34s — ~400 files/sec, roughly 40× the SFTP path,
+and the same trick pulled 8 GB back down in 5 minutes. That is the whole lesson:
+the transport was fine, the per-file protocol was not.
+
+### What to use instead
+
+* **Syncthing** — continuous two-way sync built for large trees; the server
+  becomes a third always-on node rather than an SFTP target.
+* **Unison** — two-way sync over ssh with its own pipelined protocol.
+* **Mutagen** — two-way sync with delta transfer, aimed at dev environments.
+* **git itself** — if the folders are working copies, `push`/`fetch` moves the
+  same state as one pack file instead of 300k individual objects. Then only the
+  uncommitted leftovers need syncing at all, which is a much smaller problem.
