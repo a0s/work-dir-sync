@@ -51,6 +51,11 @@ done
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
 YELLOW=$'\033[33m'; BLUE=$'\033[34m'; OFF=$'\033[0m'
 
+# Piped or redirected output has no use for colour.
+if [ ! -t 1 ]; then
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; OFF=""
+fi
+
 # ------------------------------------------------------------------- log modes
 
 # Our own lines start with "2026-08-11 ..."; rclone uses "2026/08/11 ...".
@@ -248,15 +253,34 @@ if [ ! -f "$CONFIG_FILE" ]; then
   exit 1
 fi
 
-# How many terminal rows a block of text occupies, accounting for wrapping and
-# ignoring the colour escapes, so the live mode knows how far to move back up.
-visual_lines() {
-  local width="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
-  awk -v w="$width" '{
-    gsub(/\033\[[0-9;]*m/, "")
-    n = length($0); if (n == 0) n = 1
-    total += int((n - 1) / w) + 1
-  } END { print total + 0 }'
+# Width of the real terminal — $COLUMNS is not exported and tput inside a
+# command substitution reports 80, which is what made the redraw drift.
+term_width() {
+  local w
+  w="$(stty size </dev/tty 2>/dev/null | awk '{print $2}')"
+  [ -n "$w" ] && [ "$w" -gt 0 ] 2>/dev/null || w="$(tput cols </dev/tty 2>/dev/null)"
+  [ -n "$w" ] && [ "$w" -gt 0 ] 2>/dev/null || w=80
+  printf '%s' "$w"
+}
+
+# Cut every line to the terminal width, counting only visible characters and
+# passing colour escapes through untouched. Nothing wraps afterwards, so the
+# frame height is simply its number of lines — no guessing involved.
+fit_width() {
+  awk -v w="$1" '{
+    out = ""; vis = 0; i = 1; n = length($0)
+    while (i <= n) {
+      c = substr($0, i, 1)
+      if (c == "\033") {                       # copy the whole escape sequence
+        j = i + 1
+        while (j <= n && substr($0, j, 1) !~ /[a-zA-Z]/) j++
+        out = out substr($0, i, j - i + 1); i = j + 1; continue
+      }
+      if (vis >= w) break
+      out = out c; vis++; i++
+    }
+    print out "\033[0m"
+  }'
 }
 
 if [ "$FOLLOW" != "1" ]; then
@@ -271,17 +295,33 @@ fi
 # clear, no alternate screen, so whatever was in the scrollback before stays
 # untouched and the last frame remains on screen after Ctrl-C.
 
-cleanup_live() { printf '\033[?25h'; echo; exit 0; }
-trap cleanup_live INT TERM
+cleanup_live() { printf '\033[?25h'; exit 0; }
 
+# Without a terminal there is nothing to redraw into — just print frames.
+if [ ! -t 1 ]; then
+  while :; do
+    render_overview
+    printf '\n'
+    sleep "$INTERVAL"
+  done
+fi
+
+trap cleanup_live INT TERM
 printf '\033[?25l'   # hide the cursor while redrawing
+
 prev=0
+prev_width=0
 
 while :; do
-  frame="$(render_overview)"
-  frame="$frame
+  width="$(term_width)"
+  # after a resize the old geometry is meaningless — start a fresh block below
+  [ "$width" != "$prev_width" ] && prev=0
+  prev_width="$width"
+
+  frame="$(render_overview)
   ${DIM}refreshing every ${INTERVAL}s — Ctrl-C to stop${OFF}"
-  now=$(printf '%s\n' "$frame" | visual_lines)
+  frame="$(printf '%s\n' "$frame" | fit_width "$width")"
+  now="$(printf '%s\n' "$frame" | wc -l | tr -d ' ')"
 
   [ "$prev" -gt 0 ] && printf '\033[%dA' "$prev"
 
@@ -289,14 +329,13 @@ while :; do
     printf '\033[2K%s\n' "$line"
   done
 
-  # a shorter frame than last time would leave stale rows behind
+  # a frame shorter than the previous one would leave stale rows behind
   if [ "$prev" -gt "$now" ]; then
-    i=$now
+    i="$now"
     while [ "$i" -lt "$prev" ]; do printf '\033[2K\n'; i=$((i + 1)); done
-    printf '\033[%dA' $((prev - now))
-    now=$prev
+    now="$prev"
   fi
 
-  prev=$now
+  prev="$now"
   sleep "$INTERVAL"
 done
