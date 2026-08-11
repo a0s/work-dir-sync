@@ -10,10 +10,11 @@
 #                               drop the baseline and force a full resync of
 #                               every pair (or those matching filter) — the
 #                               newer file wins, nothing is deleted
-#   ./status.sh --live          query the bucket directly instead of using the
-#                               last bisync listing (costs class A requests;
-#                               the answer is cached for LIVE_TTL seconds so
-#                               --tail cannot turn it into a request firehose)
+#   ./status.sh --live          query the remote directly instead of using the
+#                               last bisync listing (on an object store that
+#                               costs class A requests; the answer is cached for
+#                               LIVE_TTL seconds so --tail cannot turn it into a
+#                               request firehose)
 #   ./status.sh --check         additionally compare both sides file by file
 #                               (not allowed together with --tail)
 #   ./status.sh --logs          last 50 meaningful log lines
@@ -65,9 +66,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# Asking the bucket is the only thing here that costs money, so it never happens
-# more often than this — once per LIVE_TTL seconds, no matter how fast --tail
-# redraws. Overridable from the environment for a one-off fresher answer.
+# Asking the remote is the only thing here that costs money (on an object store)
+# or takes real time (on an SSH server), so it never happens more often than
+# this — once per LIVE_TTL seconds, no matter how fast --tail redraws.
+# Overridable from the environment for a one-off fresher answer.
 LIVE_TTL="${LIVE_TTL:-300}"
 
 # Comparing both sides file by file is a full listing of both every time; in a
@@ -149,6 +151,35 @@ ago() {  # epoch -> "12s ago" / "3m ago" / "2h 5m ago"
 
 mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
 
+# config.sh declares its backends as `storage <name> type=<backend> key=value…`.
+# Here nothing has to be written to rclone.conf — only the type is interesting,
+# because it decides which flags make sense and what to call the far side.
+STORAGE_TYPES=""
+storage() {
+  local name="$1" kv; shift
+  for kv in "$@"; do
+    case "$kv" in type=*) STORAGE_TYPES="$STORAGE_TYPES $name=${kv#type=}" ;; esac
+  done
+}
+
+# "r2:bucket/sub" -> "s3", "srv:/data" -> "sftp".
+remote_type() {
+  local name="${1%%:*}" kv
+  for kv in $STORAGE_TYPES; do
+    case "$kv" in "$name="*) printf '%s' "${kv#*=}"; return 0 ;; esac
+  done
+  rclone config show "$name" 2>/dev/null | awk -F ' *= *' '$1 == "type" { print $2; exit }'
+}
+
+# What one entry on the far side is called, so the numbers read naturally for
+# whichever backend the pair actually uses.
+remote_noun() {
+  case "$(remote_type "$1")" in
+    s3|b2|swift|azureblob|gcs) printf 'objects' ;;
+    *) printf 'files' ;;
+  esac
+}
+
 # "<count> <bytes>" from a bisync listing: "- <size> - - <mtime> \"path\"",
 # where a leading d marks a directory. Free, and already on disk — asking the
 # bucket instead costs a full listing (~1 class A request per 1000 objects)
@@ -157,24 +188,29 @@ listing_stats() {
   awk '$1 == "-" { n++; b += $2 } END { printf "%d %d", n+0, b+0 }' "$1" 2>/dev/null
 }
 
-# The one call in this script that talks to the bucket, and the reason --live
+# The one call in this script that talks to the remote, and the reason --live
 # exists as a flag rather than a default. Two things keep it from becoming an
 # expensive habit:
 #
 #   --fast-list  one recursive listing (1 class A request per 1000 objects)
 #                instead of one request per directory — a tree of 17k folders
-#                cost 17k requests and minutes of wall time without it
+#                cost 17k requests and minutes of wall time without it. Object
+#                stores only; SFTP has no such call and walks the tree anyway
 #   the cache    the answer is reused for LIVE_TTL seconds, so --tail redrawing
-#                every 5s still asks the bucket once per LIVE_TTL
+#                every 5s still asks the remote once per LIVE_TTL
 #
 # Prints the rclone JSON and, on the second line, how old the answer is.
 remote_size_json() {  # remote, key
-  local cache="$STATE_DIR/live-size-$2.json" age
+  local cache="$STATE_DIR/live-size-$2.json" age listing=()
   mkdir -p "$STATE_DIR" 2>/dev/null
+  case "$(remote_type "$1")" in
+    sftp|local) : ;;
+    *) listing=(--fast-list) ;;
+  esac
 
   age=$(( $(date +%s) - $(mtime "$cache") ))
   if [ ! -s "$cache" ] || [ "$age" -ge "$LIVE_TTL" ]; then
-    if rclone size "$1" --exclude "_wds/**" --fast-list --json >"$cache.tmp" 2>/dev/null &&
+    if rclone size "$1" --exclude "_wds/**" ${listing[@]+"${listing[@]}"} --json >"$cache.tmp" 2>/dev/null &&
        [ -s "$cache.tmp" ]; then
       mv "$cache.tmp" "$cache"
       age=0
@@ -211,7 +247,6 @@ row() { printf '    %-10s %s\n' "$1" "$2"; }
 if [ "$RESYNC_FORCE" = "1" ]; then
   [ -f "$CONFIG_FILE" ] || { echo "no config at $CONFIG_FILE" >&2; exit 1; }
   SYNC_PAIRS=()
-  storage() { :; }
   define_storages() { :; }
   . "$CONFIG_FILE"
 
@@ -244,7 +279,8 @@ if [ "$RESYNC_FORCE" = "1" ]; then
     dir="${SYNC_PAIRS[$i]#*|}"
     key="$(pair_key "$remote" "$dir")"
     rm -f "$STATE_DIR/resync-$key.done" "$STATE_DIR/failures-$key" \
-          "$STATE_DIR/resync-$key.last" "$STATE_DIR/marker-$key"
+          "$STATE_DIR/resync-$key.last" "$STATE_DIR/marker-$key" \
+          "$STATE_DIR/hashes-$key"
     printf '  %s✓%s baseline dropped for %s\n' "$GREEN" "$OFF" "$remote"
 
     # nudge the running worker so it picks this up now rather than on its timer
@@ -315,10 +351,11 @@ render_overview() {
   SYNC_PAIRS=()
   PUSH_MQTT_HOST=""; PUSH_MQTT_TOPIC_PREFIX="work-dir-sync"
   POLL_INTERVAL=60; PUSH_FALLBACK_POLL=1800
-  storage() { :; }
   define_storages() { :; }
   # shellcheck source=config.sh
   . "$CONFIG_FILE"
+  STORAGE_TYPES=""
+  define_storages          # collects the backend types, touches nothing else
 
   [ "${#SYNC_PAIRS[@]}" -gt 0 ] || { printf '\n  %sno pairs configured%s\n\n' "$YELLOW" "$OFF"; exit 0; }
 
@@ -328,6 +365,7 @@ render_overview() {
     key="$(pair_key "$remote" "$dir")"
 
     printf '\n  %s%s%s  <->  %s\n' "$BOLD" "$remote" "$OFF" "${dir/#$HOME/~}"
+    noun="$(remote_noun "$remote")"
 
     session="$(bisync_name "$dir" "$remote")"
   lst_local="$STATE_DIR/bisync/$session.path1.lst"
@@ -358,21 +396,21 @@ render_overview() {
       rcount=$(printf '%s' "$rjson" | sed -n 's/.*"count":\([0-9]*\).*/\1/p')
       rbytes=$(printf '%s' "$rjson" | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p')
       [ "${rage:-0}" -lt 5 ] 2>/dev/null && when="live" || when="live, $(ago $(( $(date +%s) - rage )))"
-      row "remote" "${rcount:-0} objects, $(hsize "${rbytes:-0}") ${DIM}($when)${OFF}"
+      row "remote" "${rcount:-0} $noun, $(hsize "${rbytes:-0}") ${DIM}($when)${OFF}"
     else
       row "remote" "${RED}unreachable${OFF} — check credentials/network"
       rcount=-1; rbytes=-1
     fi
   elif [ -z "$lst_remote" ]; then
     # Before the first resync finishes there is no listing to read, and asking
-    # the bucket instead would repeat a full listing on every redraw. Say so
+    # the remote instead would repeat a full listing on every redraw. Say so
     # rather than quietly spending requests.
     row "remote" "${DIM}unknown until the first sync completes${OFF} — ./status.sh --live to ask"
     rcount=-1; rbytes=-1
   else
     set -- $(listing_stats "$lst_remote")
     rcount="${1:-0}"; rbytes="${2:-0}"
-    row "remote" "$rcount objects, $(hsize "$rbytes") ${DIM}(as of last sync)${OFF}"
+    row "remote" "$rcount $noun, $(hsize "$rbytes") ${DIM}(as of last sync)${OFF}"
   fi
 
   # Freshness comes from the bisync listing, rewritten after every successful run.
@@ -458,11 +496,13 @@ render_overview() {
       else
         ndiff="$(printf '%s' "$check_out" | sed -n 's/.*: \([0-9]*\) differences found.*/\1/p' | tail -1)"
         row "check" "${YELLOW}${ndiff:-some} difference(s)${OFF}"
-        # rclone phrases these as "file not in <the other side>"
+        # rclone phrases these as "file not in <the other side>", where the other
+        # side is spelled out per backend ("S3 bucket", "sftp://user@host/…") —
+        # so only the local one is matched by name, everything else is remote.
         printf '%s' "$check_out" |
           sed -E \
             -e 's/^.*ERROR : (.*): file not in Local file system.*/               \1 — only on remote/' \
-            -e 's/^.*ERROR : (.*): file not in S3 bucket.*/               \1 — only local/' \
+            -e 's/^.*ERROR : (.*): file not in .*/               \1 — only local/' \
             -e 's/^.*ERROR : (.*): sizes differ.*/               \1 — sizes differ/' |
           grep '^ ' | head -8
       fi

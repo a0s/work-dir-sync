@@ -13,7 +13,8 @@
 # section at the top of sync.sh for the full list.
 
 # Remote backends: storage <name> type=<backend> <key>=<value> ...
-# Keys are exactly the rclone config keys, see https://rclone.org/s3/ etc.
+# Keys are exactly the rclone config keys, see https://rclone.org/s3/,
+# https://rclone.org/sftp/ etc. Any backend rclone supports works here.
 define_storages() {
 
   # Cloudflare R2
@@ -26,15 +27,46 @@ define_storages() {
     secret_access_key=<SECRET_ACCESS_KEY> \
     no_check_bucket=true
 
+  # Your own server over SSH. rclone speaks SFTP itself — no sshfs, no macFUSE,
+  # nothing to mount; the server only needs a working sshd.
+  #
+  # Already described in ~/.ssh/config? Point rclone at the system ssh and the
+  # whole entry applies (HostName, User, IdentityFile, ProxyJump, …). With ssh=
+  # set rclone ignores its own host/user/port/key_file keys:
+  # storage my-server type=sftp ssh="ssh my-server"
+  #
+  # Otherwise spell the connection out:
+  # storage my-server \
+  #   type=sftp \
+  #   host=example.com \
+  #   user=bob \
+  #   port=22 \
+  #   key_file=$HOME/.ssh/id_ed25519 \
+  #   known_hosts_file=$HOME/.ssh/known_hosts \
+  #   shell_type=unix \
+  #   md5sum_command=md5sum \
+  #   sha1sum_command=sha1sum
+  #
+  # The key must be usable without typing anything: the daemon runs under
+  # launchd and has no terminal to ask on. Either use a passphrase-less key, or
+  # add key_file_pass=<passphrase> (rclone stores it scrambled in rclone.conf).
+  # Password login instead of a key: pass=<password>, same caveat.
+  # known_hosts_file is what makes rclone verify the host key at all — without
+  # it any server answering on that address is accepted.
+  # shell_type/md5sum_command/sha1sum_command are optional: they only spare
+  # rclone the probing it otherwise does on every connection.
+
   # storage b2-backup type=b2 account=... key=...
 }
 
-# Pairs to keep in sync: "<storage>:<bucket>[/subfolder]|<local folder>"
-# The local folder is created automatically; a subfolder inside the bucket works
-# too, then only that subtree is synced.
+# Pairs to keep in sync: "<storage>:<path>|<local folder>"
+# For object storage the remote path is "<bucket>[/subfolder]", for SSH servers
+# it is a path on the server — absolute ("srv:/srv/sync") or relative to the
+# login home ("srv:sync"). The local folder is created automatically.
 SYNC_PAIRS=(
   "r2-cloudflare:my-bucket|$HOME/my-folder"
   # "r2-cloudflare:another-bucket/some_folder|$HOME/another-folder"
+  # "my-server:/srv/work-dir-sync/notes|$HOME/notes"
 )
 
 # Optional overrides, defaults shown:
@@ -42,6 +74,13 @@ SYNC_PAIRS=(
 # PROPAGATE_EMPTY_SIDE=0     # 1 = a wiped side really wipes the other one
 # MAX_DELETE_PERCENT=50      # mass-deletion guard
 # EXTRA_RCLONE_FLAGS=""      # e.g. "--bwlimit 10M"
+# SFTP_TRANSFERS=4           # parallelism for SSH pairs; one connection each,
+# SFTP_CHECKERS=4            # and sshd hands out ten by default (MaxSessions)
+# SFTP_COMPARE="size,modtime,checksum"
+#                            # SSH pairs compare by content: the server hashes
+#                            # the file itself, so two machines cannot drift
+#                            # apart unnoticed. With ssh= set ControlMaster in
+#                            # ~/.ssh/config, or every hash opens a connection.
 
 # --- optional: push notifications over MQTT ---------------------------------
 # Without this the daemon polls the change marker every POLL_INTERVAL seconds.

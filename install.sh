@@ -93,6 +93,46 @@ else
   info "push not configured — the daemon will poll the change marker"
 fi
 
+# ------------------------------------------------------------------ ssh keys
+#
+# The daemon runs under launchd, with no terminal to type a passphrase into. A
+# key it cannot open on its own means a pair that silently never syncs, which is
+# far easier to diagnose here than in the log three days later.
+
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+
+SFTP_KEYS="$(
+  storage() {
+    local kv type="" key="" pass=""
+    shift
+    for kv in "$@"; do
+      case "$kv" in
+        type=*)          type="${kv#type=}" ;;
+        key_file=*)      key="${kv#key_file=}" ;;
+        key_file_pass=*) pass=1 ;;
+      esac
+    done
+    [ "$type" = "sftp" ] && [ -n "$key" ] && [ -z "$pass" ] && printf '%s\n' "$key"
+    return 0
+  }
+  define_storages() { :; }
+  . "$CONFIG_FILE"
+  define_storages
+)"
+
+while IFS= read -r keyfile; do
+  [ -n "$keyfile" ] || continue
+  keyfile="${keyfile/#\~/$HOME}"
+  if [ ! -f "$keyfile" ]; then
+    warn "SSH key $keyfile does not exist — that pair will not connect"
+  elif ssh-keygen -y -P "" -f "$keyfile" >/dev/null 2>&1; then
+    ok "SSH key $keyfile is usable without a passphrase"
+  else
+    warn "SSH key $keyfile needs a passphrase — launchd cannot type one."
+    warn "  Add key_file_pass=<passphrase> to that storage, or use a bare key."
+  fi
+done <<<"$SFTP_KEYS"
+
 [ -f "$DIR/filters.txt" ] || die "filters.txt is missing"
 mkdir -p "$LOG_DIR"
 

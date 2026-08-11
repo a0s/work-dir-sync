@@ -1,7 +1,8 @@
 # work-dir-sync
 
-Continuous **two-way** sync between local folders and remote object storage
-(Cloudflare R2 or any other rclone backend), running as a user launchd agent.
+Continuous **two-way** sync between local folders and a remote — object storage
+(Cloudflare R2, S3, B2…) or **your own server over SSH** — running as a user
+launchd agent.
 
 * local changes → detected instantly via **fswatch** (FSEvents), synced within seconds
 * remote changes → picked up by polling every `POLL_INTERVAL` seconds
@@ -74,16 +75,137 @@ Those two blocks are all the config needs. Every other knob — polling interval
 safety thresholds, trash location, rclone flags — has a default in the "Defaults"
 section at the top of `sync.sh` and only has to appear in `config.sh` to override it.
 
+## Syncing to your own server (SSH)
+
+Any backend rclone supports works, `type=` is passed straight through. For a
+plain Linux box that means **SFTP** — rclone speaks the protocol itself over an
+ordinary SSH connection, so the server needs nothing but a running `sshd`:
+
+```sh
+define_storages() {
+  storage my-server \
+    type=sftp \
+    host=example.com user=bob port=22 \
+    key_file=$HOME/.ssh/id_ed25519 \
+    known_hosts_file=$HOME/.ssh/known_hosts
+}
+
+SYNC_PAIRS=(
+  "my-server:/srv/work-dir-sync/notes|$HOME/notes"   # absolute path
+  "my-server:notes|$HOME/notes"                      # …or relative to $HOME
+)
+```
+
+### Using an existing `~/.ssh/config` entry
+
+If the server is already described in `~/.ssh/config`, don't repeat it here.
+`ssh=` makes rclone shell out to the system `ssh` instead of using its own
+client, and then the whole entry applies — `HostName`, `Port`, `User`,
+`IdentityFile`, `ProxyJump`, agent forwarding, everything:
+
+```sh
+# ~/.ssh/config
+Host work-dir-sync
+    HostName 10.0.0.7
+    User bob
+    IdentityFile ~/.ssh/id_ed25519
+
+# config.sh
+storage work-dir-sync type=sftp ssh="ssh work-dir-sync"
+```
+
+With `ssh=` set rclone ignores its own `host`/`user`/`port`/`key_file` keys
+completely, so the ssh entry is the single source of truth. The command still
+has to log in without asking anything — a key in the agent, or a
+passphrase-less one. rclone opens a new `ssh` process per connection, which is
+slightly slower than its built-in client and the reason this is not the default.
+
+Two things are worth getting right when configuring the server *here* instead:
+
+* **the key must open without a passphrase.** The daemon runs under launchd and
+  has no terminal to ask on. Use a bare key, or add `key_file_pass=…` (rclone
+  stores it scrambled). `install.sh` checks this and warns.
+* **set `known_hosts_file`.** Without it rclone accepts whatever host key it is
+  offered, which is the one security property SSH is here for.
+
+`SFTP_TRANSFERS`/`SFTP_CHECKERS` (4 and 4) replace the S3 numbers for such
+pairs: rclone opens one SSH connection per transfer and per checker, and `sshd`
+allows ten before refusing more. `--fast-list` is dropped too — SFTP has no
+recursive listing to ask for.
+
+### Comparing by content, and why `ControlMaster` matters
+
+SSH pairs compare `size,modtime,checksum` (`SFTP_COMPARE`) instead of the
+`size,modtime` object stores get. The server hashes the file itself with
+`md5sum`, so nothing is transferred to find out whether two files differ — and
+whether it can do that is asked once per pair and remembered (a server without
+`md5sum` falls back to `size,modtime` with a line in the log, rather than
+failing every run).
+
+This closes a real hole. With size and modtime alone, two versions of the same
+file that happen to share a size and land in the same `--modify-window` look
+identical, so two machines writing at the same moment drift apart and *stay*
+apart, each convinced it is in sync. Reproduced on a test rig, and reproduced as
+fixed with checksums on.
+
+The price is that rclone runs one hash command per file, and with `ssh=` that
+means **one new SSH connection per file**. Measured against a test server, 213
+files:
+
+| | SSH logins | wall time (loopback) |
+| --- | --- | --- |
+| plain `ssh=` | 222 | 1.2 s |
+| `ssh=` + `ControlMaster` | **1** | 0.8 s |
+
+On loopback the difference is invisible; over a real network, where every login
+is a TCP handshake plus a key exchange, it is the difference between seconds and
+minutes. So if you use `ssh=`, multiplex:
+
+```sh
+# ~/.ssh/config
+Host work-dir-sync
+    HostName 10.0.0.7
+    User bob
+    ControlMaster auto
+    ControlPath /tmp/cm-%C     # must stay under ~104 chars — it is a unix socket
+    ControlPersist 60s
+```
+
+rclone's built-in client (no `ssh=`) reuses its own connection pool and needs
+none of this.
+
+### SFTP or SSHFS?
+
+Not the same thing, and only one of them belongs here:
+
+| | what it is | cost on macOS |
+| --- | --- | --- |
+| **SFTP** (rclone `type=sftp`) | rclone talks the SFTP subprotocol over SSH directly | nothing to install, no kernel extension |
+| **SSHFS** | a FUSE filesystem that *mounts* the server as a local folder | needs macFUSE, a kernel/system extension, and a reboot to install |
+
+With SSHFS the remote would look like a local directory, so `bisync` would treat
+it as one: every stat is a network round trip, an unmounted or stalled mount
+looks exactly like "the folder is empty" (the case `PROPAGATE_EMPTY_SIDE`
+exists for), and macOS has been steadily narrowing what third-party kernel
+extensions may do. The SFTP backend has none of that — it is the same rclone
+code path as S3, just with a different transport. That is what this adds.
+
+MQTT push works with SSH pairs unchanged: it never touches the storage backend,
+it only tells the other machine that something moved. A `mosquitto` broker on
+the same server you are syncing to is a reasonable place to put it.
+
 ## How a change is noticed
 
 Local changes are picked up instantly by FSEvents. For changes made on *another*
 machine there are two mechanisms:
 
 1. **Change marker** (always on). After a run that moved something, the agent
-   writes `_wds/HEAD` — `"<epoch> <machine-id>"` — into the bucket. Others read
+   writes `_wds/HEAD` — `"<epoch> <machine-id>"` — into the remote. Others read
    just that object, one class B request, and only then does a real listing
    happen. Compare with listing the bucket every cycle: ~1 class A request per
-   1000 objects, against a free allowance ten times smaller than class B.
+   1000 objects, against a free allowance ten times smaller than class B. On an
+   SSH server nothing is billed, but the marker still pays for itself: one small
+   read beats walking a deep tree with a round trip per directory.
 2. **Push over MQTT** (optional, `PUSH_MQTT_*` in the config). The other machine
    is told immediately, so the marker is only read every `PUSH_FALLBACK_POLL`
    seconds as a fallback — the difference between ~260k and ~1.5k requests a
@@ -108,12 +230,20 @@ bucket by something other than this daemon.
   empty folder usually means "not mounted yet"). By default the empty side is
   restored from the other one; set `PROPAGATE_EMPTY_SIDE=1` to really wipe both
 
+What none of this covers: there is no lock shared *between* machines — each one
+locks only its own bisync workdir. Two machines editing the same file within the
+same cycle can therefore both push, and the one that writes last wins. Comparing
+by content (above) guarantees they converge instead of drifting, but the losing
+version is only kept as `.conflict1` when a single run sees both sides change;
+when the two runs overlap, it can be overwritten without a copy being kept.
+Files edited on one machine at a time — the normal case — are unaffected.
+
 ## Operate
 
 ```sh
 ./status.sh                  # agent state, per-pair stats, freshness, trash
 ./status.sh --tail           # same, redrawn in place every 5s (-i N to change)
-./status.sh --live           # query the bucket directly (costs class A requests)
+./status.sh --live           # query the remote directly (on S3: class A requests)
 ./status.sh --check          # additionally compare both sides file by file
 ./status.sh --logs           # last 50 meaningful log lines, colorised
 ./status.sh --logs -n 200    # ...more of them
@@ -129,7 +259,7 @@ files that actually moved; the rest of rclone's per-cycle chatter is hidden
 behind `--raw`.
 
 The dashboard is free to look at: both sides are read from the bisync listing
-on disk, never from the bucket. Until the first resync finishes there is no
+on disk, never from the remote. Until the first resync finishes there is no
 listing yet, and the remote column says so instead of asking — `--live` asks,
 and caches the answer for `LIVE_TTL` seconds (300 by default) so `--tail` cannot
 turn it into a request firehose. `--check` compares both sides in full and is
