@@ -1,0 +1,44 @@
+#!/bin/bash
+#
+# work-dir-sync configuration — copy to config.sh and fill in.
+#
+#   cp config.sh.example config.sh && chmod 600 config.sh
+#
+# config.sh holds credentials and is NOT committed (see .gitignore).
+# The running daemon watches this file: saving it re-execs the daemon, so new
+# storages and pairs are picked up automatically (syntax is checked first).
+#
+# Only the two blocks below are required. Every other knob has a default in
+# sync.sh and only needs to be set here to override it — see the "Defaults"
+# section at the top of sync.sh for the full list.
+
+# Remote backends: storage <name> type=<backend> <key>=<value> ...
+# Keys are exactly the rclone config keys, see https://rclone.org/s3/ etc.
+define_storages() {
+
+  # Cloudflare R2
+  storage r2-cloudflare \
+    type=s3 \
+    provider=Cloudflare \
+    region=auto \
+    endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+    access_key_id=<ACCESS_KEY_ID> \
+    secret_access_key=<SECRET_ACCESS_KEY> \
+    no_check_bucket=true
+
+  # storage b2-backup type=b2 account=... key=...
+}
+
+# Pairs to keep in sync: "<storage>:<bucket>[/subfolder]|<local folder>"
+# The local folder is created automatically; a subfolder inside the bucket works
+# too, then only that subtree is synced.
+SYNC_PAIRS=(
+  "r2-cloudflare:my-bucket|$HOME/my-folder"
+  # "r2-cloudflare:another-bucket/some_folder|$HOME/another-folder"
+)
+
+# Optional overrides, defaults shown:
+# POLL_INTERVAL=60           # remote polling interval, seconds
+# PROPAGATE_EMPTY_SIDE=0     # 1 = a wiped side really wipes the other one
+# MAX_DELETE_PERCENT=50      # mass-deletion guard
+# EXTRA_RCLONE_FLAGS=""      # e.g. "--bwlimit 10M"

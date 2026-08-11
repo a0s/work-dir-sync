@@ -1,0 +1,32 @@
+# rclone bisync filters — shared by both sides of every pair.
+# NOTE: the file must be identical for path1 and path2; after editing it rclone
+# demands a fresh --resync (the script performs it automatically).
+#
+# Syntax: "- pattern" excludes, "+ pattern" includes.
+
+# --- macOS junk ---
+- .DS_Store
+- ._*
+- .Spotlight-V100/**
+- .Trashes/**
+- .TemporaryItems/**
+- .fseventsd/**
+- .DocumentRevisions-V100/**
+- .apdisk
+
+# --- editor temp files ---
+- *.swp
+- *.swo
+- *~
+- .#*
+- \#*\#
+
+# --- internal ---
+- .rclone-bisync-*/**
+- *.conflict[0-9]*
+
+# --- uncomment if desired ---
+# - .git/**
+# - node_modules/**
+# - .venv/**
+# - __pycache__/**
