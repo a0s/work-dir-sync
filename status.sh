@@ -6,6 +6,8 @@
 #   ./status.sh                 overview, printed once
 #   ./status.sh --tail          live overview, redrawn in place every 5s
 #   ./status.sh --tail -i 10    ...at a different interval
+#   ./status.sh --live          query the bucket directly instead of using the
+#                               last bisync listing (costs class A requests)
 #   ./status.sh --check         additionally compare both sides file by file
 #   ./status.sh --logs          last 50 meaningful log lines
 #   ./status.sh --logs -n 200   ...more of them
@@ -32,6 +34,7 @@ MODE="overview"
 RAW=0
 FOLLOW=0
 DEEP_CHECK=0
+LIVE=0
 LINES=50
 INTERVAL=5
 while [ $# -gt 0 ]; do
@@ -40,6 +43,7 @@ while [ $# -gt 0 ]; do
     --raw)   RAW=1 ;;
     --tail|-f) FOLLOW=1 ;;
     --check) DEEP_CHECK=1 ;;
+    --live)  LIVE=1 ;;
     -n) shift; LINES="${1:-50}" ;;
     --interval|-i) shift; INTERVAL="${1:-5}" ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
@@ -119,7 +123,25 @@ ago() {  # epoch -> "12s ago" / "3m ago" / "2h 5m ago"
 }
 
 mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
-pair_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# "<count> <bytes>" from a bisync listing: "- <size> - - <mtime> \"path\"",
+# where a leading d marks a directory. Free, and already on disk — asking the
+# bucket instead costs a full listing (~1 class A request per 1000 objects)
+# every single time status is shown, which --tail would repeat every few seconds.
+listing_stats() {
+  awk '$1 == "-" { n++; b += $2 } END { printf "%d %d", n+0, b+0 }' "$1" 2>/dev/null
+}
+# must match sync.sh: a pair is identified by both sides
+pair_key() { printf '%s__%s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# How rclone names a bisync session on disk: "<path1>..<path2>", each with
+# everything but [A-Za-z0-9._-] replaced by _ and no leading/trailing separator.
+bisync_name() {
+  local a b
+  a="$(printf '%s' "${1#/}" | tr -c 'A-Za-z0-9._-' '_' | sed 's/_*$//')"
+  b="$(printf '%s' "$2"     | tr -c 'A-Za-z0-9._-' '_' | sed 's/_*$//')"
+  printf '%s..%s' "$a" "$b"
+}
 row() { printf '    %-10s %s\n' "$1" "$2"; }
 
 # ------------------------------------------------------------------- overview
@@ -164,6 +186,8 @@ render_overview() {
 
   # Pull SYNC_PAIRS out of the config without running anything else in it.
   SYNC_PAIRS=()
+  PUSH_MQTT_HOST=""; PUSH_MQTT_TOPIC_PREFIX="work-dir-sync"
+  POLL_INTERVAL=60; PUSH_FALLBACK_POLL=1800
   storage() { :; }
   define_storages() { :; }
   # shellcheck source=config.sh
@@ -174,10 +198,17 @@ render_overview() {
   for i in $(seq 0 $((${#SYNC_PAIRS[@]} - 1))); do
     remote="${SYNC_PAIRS[$i]%%|*}"
     dir="${SYNC_PAIRS[$i]#*|}"
-    key="$(pair_key "$remote")"
+    key="$(pair_key "$remote" "$dir")"
 
     printf '\n  %s%s%s  <->  %s\n' "$BOLD" "$remote" "$OFF" "${dir/#$HOME/~}"
 
+    session="$(bisync_name "$dir" "$remote")"
+  lst_local="$STATE_DIR/bisync/$session.path1.lst"
+  lst_remote="$STATE_DIR/bisync/$session.path2.lst"
+  [ -f "$lst_local" ]  || lst_local=""
+  [ -f "$lst_remote" ] || lst_remote=""
+
+  if [ "$LIVE" = "1" ] || [ -z "$lst_local" ]; then
     if [ -d "$dir" ]; then
       lcount=$(find "$dir" -type f ! -name '.DS_Store' ! -name '._*' 2>/dev/null | wc -l | tr -d ' ')
       lbytes=$(find "$dir" -type f ! -name '.DS_Store' ! -name '._*' -print0 2>/dev/null |
@@ -187,19 +218,30 @@ render_overview() {
       row "local" "${YELLOW}folder does not exist yet${OFF}"
       lcount=-1; lbytes=-1
     fi
+  else
+    set -- $(listing_stats "$lst_local")
+    lcount="${1:-0}"; lbytes="${2:-0}"
+    row "local" "$lcount files, $(hsize "$lbytes") ${DIM}(as of last sync)${OFF}"
+  fi
 
-    rjson="$(rclone size "$remote" --json 2>/dev/null)"
+  if [ "$LIVE" = "1" ] || [ -z "$lst_remote" ]; then
+    rjson="$(rclone size "$remote" --exclude "_wds/**" --json 2>/dev/null)"
     if [ -n "$rjson" ]; then
       rcount=$(printf '%s' "$rjson" | sed -n 's/.*"count":\([0-9]*\).*/\1/p')
       rbytes=$(printf '%s' "$rjson" | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p')
-      row "remote" "${rcount:-0} objects, $(hsize "${rbytes:-0}")"
+      row "remote" "${rcount:-0} objects, $(hsize "${rbytes:-0}") ${DIM}(live)${OFF}"
     else
       row "remote" "${RED}unreachable${OFF} — check credentials/network"
       rcount=-1; rbytes=-1
     fi
+  else
+    set -- $(listing_stats "$lst_remote")
+    rcount="${1:-0}"; rbytes="${2:-0}"
+    row "remote" "$rcount objects, $(hsize "$rbytes") ${DIM}(as of last sync)${OFF}"
+  fi
 
-    # Freshness comes from the bisync listing, rewritten after every successful run.
-    listing="$(ls -t "$STATE_DIR/bisync/"*"$key".path1.lst 2>/dev/null | head -1)"
+  # Freshness comes from the bisync listing, rewritten after every successful run.
+    listing="$lst_local"
     last_sync="$(mtime "${listing:-/nonexistent}")"
 
     verdict=""
@@ -214,11 +256,31 @@ render_overview() {
     # A run in progress holds a lock file naming its PID; while it lasts the
     # listing and the shared log stay untouched, which used to look like a stall.
     run_log="$STATE_DIR/last-run-$key.log"
-    lock="$(ls "$STATE_DIR/bisync/"*"$key".lck 2>/dev/null | head -1)"
+    lock="$STATE_DIR/bisync/$session.lck"
+    [ -f "$lock" ] || lock=""
     running_pid=""
     if [ -n "$lock" ]; then
       running_pid="$(sed -n 's/.*"PID":"\([0-9]*\)".*/\1/p' "$lock")"
       kill -0 "$running_pid" 2>/dev/null || running_pid=""
+    fi
+
+    # push subscription, when configured
+    if [ -n "$PUSH_MQTT_HOST" ]; then
+      if [ -f "$STATE_DIR/push-active-$key" ] && pgrep -f "mosquitto_sub .*$PUSH_MQTT_HOST" >/dev/null 2>&1; then
+        push_state="${GREEN}subscribed${OFF} to $PUSH_MQTT_HOST"
+      else
+        push_state="${RED}not subscribed${OFF} ($PUSH_MQTT_HOST) — falling back to polling"
+      fi
+      last_push="$(cat "$STATE_DIR/push-last-$key" 2>/dev/null || echo 0)"
+      if [ "$last_push" -gt 0 ] 2>/dev/null; then
+        push_state="$push_state · last notification $(ago "$last_push")"
+      else
+        push_state="$push_state · nothing received yet"
+      fi
+      row "push" "$push_state"
+      row "marker" "fallback check every ${PUSH_FALLBACK_POLL}s"
+    else
+      row "push" "${DIM}off${OFF} — polling the marker every ${POLL_INTERVAL}s"
     fi
 
     if [ -n "$running_pid" ]; then
@@ -228,9 +290,9 @@ render_overview() {
       progress="$(tail -c 65536 "$run_log" 2>/dev/null |
                   grep -E '[0-9]+%' | tail -1 | sed -E 's/^[0-9\/]+ [0-9:]+ [A-Z]+ *: *//')"
       if [ -n "$progress" ]; then
-        row "syncing" "${BLUE}now${OFF} — $progress (started $(ago "$started_epoch"))"
+        row "syncing" "${BLUE}now${OFF} — $progress"
       else
-        row "syncing" "${BLUE}now${OFF} — building listings (started $(ago "$started_epoch"))"
+        row "syncing" "${BLUE}now${OFF} — building listings"
       fi
     fi
 

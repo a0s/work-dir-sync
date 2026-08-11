@@ -42,3 +42,16 @@ SYNC_PAIRS=(
 # PROPAGATE_EMPTY_SIDE=0     # 1 = a wiped side really wipes the other one
 # MAX_DELETE_PERCENT=50      # mass-deletion guard
 # EXTRA_RCLONE_FLAGS=""      # e.g. "--bwlimit 10M"
+
+# --- optional: push notifications over MQTT ---------------------------------
+# Without this the daemon polls the change marker every POLL_INTERVAL seconds.
+# With it the other machine is notified instantly and the marker is only read
+# every PUSH_FALLBACK_POLL seconds as a fallback.
+# Needs mosquitto (brew install mosquitto). Works with any MQTT broker;
+# HiveMQ Cloud Serverless has a permanently free tier.
+# PUSH_MQTT_HOST="xxxxxxxx.s1.eu.hivemq.cloud"
+# PUSH_MQTT_PORT=8883
+# PUSH_MQTT_USER="..."
+# PUSH_MQTT_PASS="..."
+# PUSH_MQTT_TOPIC_PREFIX="work-dir-sync"   # topic per pair: <prefix>/<bucket>
+# PUSH_FALLBACK_POLL=1800

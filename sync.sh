@@ -78,6 +78,21 @@ FULL_SCAN_INTERVAL=86400
 # excluded in filters.txt, otherwise it syncs itself back and forth.
 MARKER_PATH="_wds/HEAD"
 
+# ---- optional push notifications (MQTT) -------------------------------------
+# Set PUSH_MQTT_HOST (plus user/pass) in the config to enable. With push on, the
+# other machine is told the instant something changed, so the marker is only
+# read as a fallback every PUSH_FALLBACK_POLL seconds instead of every
+# POLL_INTERVAL — that is the difference between ~260k and ~2k requests a month.
+# Without it nothing changes: the daemon just polls the marker as before.
+PUSH_MQTT_HOST=""
+PUSH_MQTT_PORT=8883
+PUSH_MQTT_USER=""
+PUSH_MQTT_PASS=""
+PUSH_MQTT_TOPIC_PREFIX="work-dir-sync"
+PUSH_MQTT_CAFILE=""          # empty = let mosquitto use the system CA bundle
+PUSH_FALLBACK_POLL=1800      # marker check interval while push is healthy
+PUSH_RECONNECT_DELAY=5       # backoff before re-subscribing after a drop
+
 # Quiet period after a local event before syncing, seconds — coalesces bursts.
 DEBOUNCE_SECONDS=3
 
@@ -181,11 +196,21 @@ acquire_lock() {
 
 WATCHER_PIDS=""
 
+# Kills a process and everything under it. Subscribers live two levels down
+# (worker -> subshell -> mosquitto_sub), so killing only direct children left
+# orphaned subscribers behind on every restart.
+kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$child"
+  done
+  kill "$pid" 2>/dev/null
+}
+
 kill_watchers() {
   local p
   for p in $WATCHER_PIDS; do
-    pkill -P "$p" 2>/dev/null
-    kill "$p" 2>/dev/null
+    kill_tree "$p"
   done
   WATCHER_PIDS=""
 }
@@ -571,6 +596,67 @@ publish_marker() {
   printf '%s' "$val" >"$STATE_DIR/marker-$key"
 }
 
+# --------------------------------------------------------------- push (MQTT)
+
+push_enabled() { [ -n "$PUSH_MQTT_HOST" ]; }
+
+push_topic() { printf '%s/%s' "$PUSH_MQTT_TOPIC_PREFIX" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+
+mqtt_common_args() {
+  MQTT_ARGS=(-h "$PUSH_MQTT_HOST" -p "$PUSH_MQTT_PORT")
+  [ -n "$PUSH_MQTT_USER" ] && MQTT_ARGS+=(-u "$PUSH_MQTT_USER")
+  [ -n "$PUSH_MQTT_PASS" ] && MQTT_ARGS+=(-P "$PUSH_MQTT_PASS")
+  if [ -n "$PUSH_MQTT_CAFILE" ]; then
+    MQTT_ARGS+=(--cafile "$PUSH_MQTT_CAFILE")
+  elif [ "$PUSH_MQTT_PORT" = "8883" ] && [ -f /etc/ssl/cert.pem ]; then
+    MQTT_ARGS+=(--cafile /etc/ssl/cert.pem)   # TLS brokers (HiveMQ Cloud et al.)
+  fi
+}
+
+# Announce our change to whoever is listening. Retained, so a machine that was
+# asleep gets the latest state the moment it subscribes.
+push_publish() {
+  local remote="$1" payload="$2"
+  push_enabled || return 0
+  command -v mosquitto_pub >/dev/null 2>&1 || return 1
+  mqtt_common_args
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "$(push_topic "$remote")" -q 1 -r -m "$payload" 2>/dev/null
+}
+
+# Long-lived subscription feeding the pair's worker. QoS 1 with a stable client
+# id and a persistent session means the broker queues notifications for us while
+# the laptop sleeps, instead of dropping them.
+start_push_subscriber() {
+  local remote="$1" fifo="$2" key="$3"
+  push_enabled || return 0
+  if ! command -v mosquitto_sub >/dev/null 2>&1; then
+    log "[$remote] push configured but mosquitto_sub is missing — falling back to polling"
+    return 1
+  fi
+  local topic; topic="$(push_topic "$remote")"
+  local client_id="wds-${MACHINE_ID}-${key}"
+  client_id="$(printf '%s' "$client_id" | cut -c1-64)"
+  mqtt_common_args
+  (
+    while :; do
+      mosquitto_sub "${MQTT_ARGS[@]}" -t "$topic" -q 1 -i "$client_id" -c 2>/dev/null |
+      while IFS= read -r msg; do
+        case "$msg" in
+          *"$MACHINE_ID") continue ;;              # our own announcement
+        esac
+        date +%s >"$STATE_DIR/push-last-$key"
+        printf 'REMOTE\n' >"$fifo"
+      done
+      date +%s >"$STATE_DIR/push-down-$key"
+      sleep "$PUSH_RECONNECT_DELAY"
+    done
+  ) &
+  WATCHER_PIDS="$WATCHER_PIDS $!"
+  printf '%s' "$topic" >"$STATE_DIR/push-topic-$key"
+  log "[$remote] subscribed to $PUSH_MQTT_HOST topic $topic"
+  return 0
+}
+
 # Did the last bisync run actually move anything?
 run_touched_anything() {
   grep -qE ': (Copied|Deleted|Moved|Updated|Renamed)' "$STATE_DIR/last-run-$1.log" 2>/dev/null
@@ -595,16 +681,31 @@ pair_worker() {
   start_pair_watcher "$idx" "$dir" "$fifo"
   log "[$remote] worker started, watching $dir"
 
-  local last_sync=0 last_full=0 pending=1 reason now wait
+  # With a working subscription the marker is only a fallback, so it can be read
+  # rarely; without one it is the only way to notice the other machine.
+  local marker_interval="$POLL_INTERVAL"
+  rm -f "$STATE_DIR/push-active-$key"
+  if start_push_subscriber "$remote" "$fifo" "$key"; then
+    if push_enabled; then
+      marker_interval="$PUSH_FALLBACK_POLL"
+      : >"$STATE_DIR/push-active-$key"
+    fi
+  fi
+
+  local last_sync=0 last_full=0 last_marker=0 pending=1 reason now wait ev
 
   while :; do
     now="$(date +%s)"
     reason=""
     if [ "$pending" = "1" ]; then
       reason="local changes"
-    elif remote_marker_changed "$remote" "$key"; then
-      reason="remote update"
-    elif [ $((now - last_full)) -ge "$FULL_SCAN_INTERVAL" ]; then
+    elif [ "$pending" = "push" ]; then
+      reason="push notification"
+    elif [ $((now - last_marker)) -ge "$marker_interval" ]; then
+      last_marker="$now"
+      remote_marker_changed "$remote" "$key" && reason="remote update"
+    fi
+    if [ -z "$reason" ] && [ $((now - last_full)) -ge "$FULL_SCAN_INTERVAL" ]; then
       reason="periodic full scan"
     fi
 
@@ -619,7 +720,9 @@ pair_worker() {
       if run_bisync "$remote" "$dir"; then
         if run_touched_anything "$key"; then
           publish_marker "$remote" "$key"
-          log "[$remote] done, marker published"
+          push_publish "$remote" "$(cat "$STATE_DIR/marker-$key" 2>/dev/null)" &&
+            log "[$remote] done, marker published and push sent" ||
+            log "[$remote] done, marker published"
         fi
       fi
       last_sync="$(date +%s)"
@@ -630,10 +733,15 @@ pair_worker() {
       continue
     fi
 
-    # nothing to do — wait for a local event or for the next marker check
-    if read -r -u 3 -t "$POLL_INTERVAL" _; then
-      pending=1
-      while read -r -u 3 -t "$DEBOUNCE_SECONDS" _; do :; done
+    # idle: wait for a local event, a push, or the next marker check
+    wait=$((marker_interval - (now - last_marker)))
+    [ "$wait" -lt 1 ] && wait=1
+    if read -r -u 3 -t "$wait" ev; then
+      case "$ev" in
+        REMOTE) pending="push" ;;
+        *)      pending=1
+                while read -r -u 3 -t "$DEBOUNCE_SECONDS" _; do :; done ;;
+      esac
     fi
   done
 }
@@ -696,6 +804,13 @@ done
 MACHINE_ID="$(machine_id)"
 log "machine id: $MACHINE_ID"
 
+# A crash (or a kill -9) can leave our subscribers orphaned; they are identified
+# by our machine id in the client id, so this never touches anyone else's.
+if pgrep -f "mosquitto_sub .*wds-$MACHINE_ID" >/dev/null 2>&1; then
+  pkill -f "mosquitto_sub .*wds-$MACHINE_ID" 2>/dev/null
+  log "cleaned up orphaned subscribers from a previous run"
+fi
+
 SELF_FIFO="$STATE_DIR/events-self.fifo"
 rm -f "$SELF_FIFO"; mkfifo "$SELF_FIFO" || { log "cannot create $SELF_FIFO"; exit 1; }
 exec 4<>"$SELF_FIFO"
@@ -705,8 +820,7 @@ WORKER_PIDS=""
 stop_workers() {
   local p
   for p in $WORKER_PIDS; do
-    pkill -P "$p" 2>/dev/null
-    kill "$p" 2>/dev/null
+    kill_tree "$p"
   done
   WORKER_PIDS=""
 }

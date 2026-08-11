@@ -74,6 +74,28 @@ Those two blocks are all the config needs. Every other knob — polling interval
 safety thresholds, trash location, rclone flags — has a default in the "Defaults"
 section at the top of `sync.sh` and only has to appear in `config.sh` to override it.
 
+## How a change is noticed
+
+Local changes are picked up instantly by FSEvents. For changes made on *another*
+machine there are two mechanisms:
+
+1. **Change marker** (always on). After a run that moved something, the agent
+   writes `_wds/HEAD` — `"<epoch> <machine-id>"` — into the bucket. Others read
+   just that object, one class B request, and only then does a real listing
+   happen. Compare with listing the bucket every cycle: ~1 class A request per
+   1000 objects, against a free allowance ten times smaller than class B.
+2. **Push over MQTT** (optional, `PUSH_MQTT_*` in the config). The other machine
+   is told immediately, so the marker is only read every `PUSH_FALLBACK_POLL`
+   seconds as a fallback — the difference between ~260k and ~1.5k requests a
+   month per pair. QoS 1 with a persistent session means the broker holds
+   notifications while a laptop sleeps instead of dropping them. Requires
+   `mosquitto` (`install.sh` installs it when push is configured).
+
+Both are belt and braces for the same thing, and neither is trusted blindly:
+`FULL_SCAN_INTERVAL` (daily by default) syncs unconditionally, covering dropped
+FSEvents, writes made while the daemon was down, and anything written to the
+bucket by something other than this daemon.
+
 ## Safety behaviour
 
 * conflicting edits on both sides: newer wins, the loser is kept as `file.conflict1`
@@ -91,6 +113,7 @@ section at the top of `sync.sh` and only has to appear in `config.sh` to overrid
 ```sh
 ./status.sh                  # agent state, per-pair stats, freshness, trash
 ./status.sh --tail           # same, redrawn in place every 5s (-i N to change)
+./status.sh --live           # query the bucket directly (costs class A requests)
 ./status.sh --check          # additionally compare both sides file by file
 ./status.sh --logs           # last 50 meaningful log lines, colorised
 ./status.sh --logs -n 200    # ...more of them

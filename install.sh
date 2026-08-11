@@ -75,6 +75,24 @@ bash -n "$DIR/sync.sh"    || die "sync.sh has a syntax error"
 bash -n "$CONFIG_FILE"    || die "config has a syntax error"
 ok "sync.sh and config parse cleanly"
 
+# mosquitto is only needed when push notifications are configured
+if grep -qE '^[[:space:]]*PUSH_MQTT_HOST=["'"'"']?[^"'"'"'[:space:]]' "$CONFIG_FILE"; then
+  for tool in mosquitto_sub mosquitto_pub; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      ok "$tool present"
+    elif command -v brew >/dev/null 2>&1; then
+      info "push is configured, installing mosquitto..."
+      brew install mosquitto >/dev/null || die "brew install mosquitto failed"
+      ok "mosquitto installed"
+      break
+    else
+      die "push is configured but $tool is missing (brew install mosquitto)"
+    fi
+  done
+else
+  info "push not configured — the daemon will poll the change marker"
+fi
+
 [ -f "$DIR/filters.txt" ] || die "filters.txt is missing"
 mkdir -p "$LOG_DIR"
 
