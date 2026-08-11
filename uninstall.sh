@@ -27,7 +27,7 @@ for arg in "$@"; do
     --state) PURGE_STATE=1 ;;
     --logs)  PURGE_LOGS=1 ;;
     --all)   PURGE_STATE=1; PURGE_LOGS=1 ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done

@@ -29,7 +29,7 @@ for arg in "$@"; do
   case "$arg" in
     --restart) FORCE_RESTART=1 ;;
     --no-start) START=0 ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done

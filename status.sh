@@ -3,7 +3,12 @@
 # Shows what work-dir-sync is doing: agent state, per-pair statistics for both
 # sides, how fresh the last sync is, and the log.
 #
-#   ./status.sh                 overview
+#   ./status.sh                 overview, printed once
+#   ./status.sh --tail          live overview, redrawn in place every 5s
+#   ./status.sh --tail -i 10    ...at a different interval
+#   ./status.sh --check         additionally compare both sides file by file
+#   ./status.sh --logs          last 50 meaningful log lines
+#   ./status.sh --logs -n 200   ...more of them
 #   ./status.sh --logs --raw    unfiltered log (includes rclone INFO chatter)
 #   ./status.sh --logs --tail   follow the log as it grows (Ctrl-C to stop)
 
@@ -37,7 +42,7 @@ while [ $# -gt 0 ]; do
     --check) DEEP_CHECK=1 ;;
     -n) shift; LINES="${1:-50}" ;;
     --interval|-i) shift; INTERVAL="${1:-5}" ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
