@@ -128,6 +128,13 @@ bash sync.sh --once          # one-off sync without the daemon
 files that actually moved; the rest of rclone's per-cycle chatter is hidden
 behind `--raw`.
 
+The dashboard is free to look at: both sides are read from the bisync listing
+on disk, never from the bucket. Until the first resync finishes there is no
+listing yet, and the remote column says so instead of asking — `--live` asks,
+and caches the answer for `LIVE_TTL` seconds (300 by default) so `--tail` cannot
+turn it into a request firehose. `--check` compares both sides in full and is
+therefore refused together with `--tail`.
+
 A run in progress is reported as `syncing now — 1.2 GiB / 3.4 GiB, 35%, ...`:
 during a long initial upload the bisync listing and the shared log are only
 written at the end, so without that line the dashboard looks frozen and the two

@@ -11,8 +11,11 @@
 #                               every pair (or those matching filter) — the
 #                               newer file wins, nothing is deleted
 #   ./status.sh --live          query the bucket directly instead of using the
-#                               last bisync listing (costs class A requests)
+#                               last bisync listing (costs class A requests;
+#                               the answer is cached for LIVE_TTL seconds so
+#                               --tail cannot turn it into a request firehose)
 #   ./status.sh --check         additionally compare both sides file by file
+#                               (not allowed together with --tail)
 #   ./status.sh --logs          last 50 meaningful log lines
 #   ./status.sh --logs -n 200   ...more of them
 #   ./status.sh --logs --raw    unfiltered log (includes rclone INFO chatter)
@@ -61,6 +64,18 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Asking the bucket is the only thing here that costs money, so it never happens
+# more often than this — once per LIVE_TTL seconds, no matter how fast --tail
+# redraws. Overridable from the environment for a one-off fresher answer.
+LIVE_TTL="${LIVE_TTL:-300}"
+
+# Comparing both sides file by file is a full listing of both every time; in a
+# loop that is exactly the request firehose this script tries to avoid.
+if [ "$DEEP_CHECK" = "1" ] && [ "$FOLLOW" = "1" ]; then
+  echo "--check costs a full listing of both sides; it cannot be combined with --tail" >&2
+  exit 2
+fi
 
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
 YELLOW=$'\033[33m'; BLUE=$'\033[34m'; OFF=$'\033[0m'
@@ -140,6 +155,37 @@ mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
 # every single time status is shown, which --tail would repeat every few seconds.
 listing_stats() {
   awk '$1 == "-" { n++; b += $2 } END { printf "%d %d", n+0, b+0 }' "$1" 2>/dev/null
+}
+
+# The one call in this script that talks to the bucket, and the reason --live
+# exists as a flag rather than a default. Two things keep it from becoming an
+# expensive habit:
+#
+#   --fast-list  one recursive listing (1 class A request per 1000 objects)
+#                instead of one request per directory — a tree of 17k folders
+#                cost 17k requests and minutes of wall time without it
+#   the cache    the answer is reused for LIVE_TTL seconds, so --tail redrawing
+#                every 5s still asks the bucket once per LIVE_TTL
+#
+# Prints the rclone JSON and, on the second line, how old the answer is.
+remote_size_json() {  # remote, key
+  local cache="$STATE_DIR/live-size-$2.json" age
+  mkdir -p "$STATE_DIR" 2>/dev/null
+
+  age=$(( $(date +%s) - $(mtime "$cache") ))
+  if [ ! -s "$cache" ] || [ "$age" -ge "$LIVE_TTL" ]; then
+    if rclone size "$1" --exclude "_wds/**" --fast-list --json >"$cache.tmp" 2>/dev/null &&
+       [ -s "$cache.tmp" ]; then
+      mv "$cache.tmp" "$cache"
+      age=0
+    else
+      rm -f "$cache.tmp"
+      [ -s "$cache" ] || return 1     # nothing fresh and nothing remembered
+    fi
+  fi
+
+  cat "$cache"
+  printf '%s\n' "$age"
 }
 # must match sync.sh: a pair is identified by both sides
 pair_key() { printf '%s__%s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '_'; }
@@ -305,16 +351,24 @@ render_overview() {
     row "local" "$lcount files, $(hsize "$lbytes") ${DIM}(as of last sync)${OFF}"
   fi
 
-  if [ "$LIVE" = "1" ] || [ -z "$lst_remote" ]; then
-    rjson="$(rclone size "$remote" --exclude "_wds/**" --json 2>/dev/null)"
+  if [ "$LIVE" = "1" ]; then
+    rjson="$(remote_size_json "$remote" "$key")"
     if [ -n "$rjson" ]; then
+      rage="$(printf '%s' "$rjson" | tail -1)"
       rcount=$(printf '%s' "$rjson" | sed -n 's/.*"count":\([0-9]*\).*/\1/p')
       rbytes=$(printf '%s' "$rjson" | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p')
-      row "remote" "${rcount:-0} objects, $(hsize "${rbytes:-0}") ${DIM}(live)${OFF}"
+      [ "${rage:-0}" -lt 5 ] 2>/dev/null && when="live" || when="live, $(ago $(( $(date +%s) - rage )))"
+      row "remote" "${rcount:-0} objects, $(hsize "${rbytes:-0}") ${DIM}($when)${OFF}"
     else
       row "remote" "${RED}unreachable${OFF} — check credentials/network"
       rcount=-1; rbytes=-1
     fi
+  elif [ -z "$lst_remote" ]; then
+    # Before the first resync finishes there is no listing to read, and asking
+    # the bucket instead would repeat a full listing on every redraw. Say so
+    # rather than quietly spending requests.
+    row "remote" "${DIM}unknown until the first sync completes${OFF} — ./status.sh --live to ask"
+    rcount=-1; rbytes=-1
   else
     set -- $(listing_stats "$lst_remote")
     rcount="${1:-0}"; rbytes="${2:-0}"
@@ -487,8 +541,16 @@ fi
 trap cleanup_live INT TERM
 printf '\033[?25l'   # hide the cursor while redrawing
 
-prev=0
-prev_width=0
+# A frame is assembled in a command substitution, so nothing reaches the screen
+# until it is complete — on a folder still being pulled down that takes a few
+# seconds and an empty screen is indistinguishable from a hang. The first frame
+# overwrites this line.
+printf '%scollecting…%s\n' "$DIM" "$OFF"
+
+prev=1
+prev_width="$(term_width)x$(term_height)"   # so the first frame does not treat
+                                            # itself as a resize and orphan the
+                                            # line above
 
 while :; do
   width="$(term_width)"
