@@ -11,7 +11,7 @@
 # sync.sh and config.sh: on change it checks the syntax and re-execs itself, so
 # newly added storages/pairs are picked up automatically.
 #
-# Config:       ~/.config/work-dir-sync/config.sh   (from config.sh.example)
+# Config:       ./config.sh, else ~/.config/work-dir-sync/config.sh
 # Log:          ~/Library/Logs/work-dir-sync/sync.log
 # One-off run:  bash ~/work-dir-sync/sync.sh --once
 
@@ -23,9 +23,20 @@ set -u
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 FILTERS_FILE="$SCRIPT_DIR/filters.txt"
-CONFIG_DIR="$HOME/.config/work-dir-sync"
-CONFIG_FILE="$CONFIG_DIR/config.sh"
 CONFIG_TEMPLATE="$SCRIPT_DIR/config.sh.example"
+
+# The config is looked up next to the script first, then in ~/.config; the more
+# specific one wins. A missing config is created at the first location.
+CONFIG_CANDIDATES=(
+  "$SCRIPT_DIR/config.sh"
+  "$HOME/.config/work-dir-sync/config.sh"
+)
+
+CONFIG_FILE="${CONFIG_CANDIDATES[0]}"
+for candidate in "${CONFIG_CANDIDATES[@]}"; do
+  if [ -f "$candidate" ]; then CONFIG_FILE="$candidate"; break; fi
+done
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 
 STATE_DIR="$HOME/.local/state/work-dir-sync"
 BISYNC_WORKDIR="$STATE_DIR/bisync"
@@ -183,9 +194,11 @@ start_watchers() {
   done
 
   # watch the script and the config (their directories — editors replace inodes)
-  local watch_dir
-  for watch_dir in "$SCRIPT_DIR" "$CONFIG_DIR"; do
+  local watch_dir seen=""
+  for watch_dir in "$SCRIPT_DIR" "$CONFIG_DIR" "$(dirname "${CONFIG_CANDIDATES[1]}")"; do
     [ -d "$watch_dir" ] || continue
+    case "$seen" in *"|$watch_dir|"*) continue ;; esac
+    seen="$seen|$watch_dir|"
     (
       fswatch -o --latency 1 "$watch_dir" 2>/dev/null | while read -r _; do
         printf 'SELF\n' >"$FIFO"
@@ -200,7 +213,9 @@ start_watchers() {
 # ------------------------------------------------------------------ self-reload
 
 # Hash of the script plus its config: either one changing triggers a restart.
-script_hash() { shasum -a 256 "$SCRIPT_PATH" "$CONFIG_FILE" 2>/dev/null | awk '{print $1}' | tr -d '\n'; }
+script_hash() {
+  shasum -a 256 "$SCRIPT_PATH" "${CONFIG_CANDIDATES[@]}" 2>/dev/null | awk '{print $1}' | tr -d '\n'
+}
 
 SCRIPT_HASH="$(script_hash)"
 BAD_HASH=""

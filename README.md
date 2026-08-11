@@ -16,11 +16,12 @@ Continuous **two-way** sync between local folders and remote object storage
 | --- | --- |
 | `sync.sh` | the daemon (engine, no settings inside) |
 | `install.sh` / `uninstall.sh` | register / unregister the launchd agent (both idempotent) |
-| `config.sh.example` | template for the config |
+| `config.sh` | storages, pairs and knobs — **credentials, gitignored** |
+| `config.sh.example` | template for `config.sh` |
 | `filters.txt` | rclone filters shared by both sides |
 
-The live config — **storages, pairs and credentials** — is deliberately kept
-outside the repository, at `~/.config/work-dir-sync/config.sh` (mode 600).
+The config is looked up next to the script first (`./config.sh`, gitignored),
+then at `~/.config/work-dir-sync/config.sh` — the more specific one wins.
 State (bisync listings, resync markers, trash) lives in
 `~/.local/state/work-dir-sync/`, the log in `~/Library/Logs/work-dir-sync/sync.log`.
 
@@ -30,8 +31,8 @@ State (bisync listings, resync markers, trash) lives in
 ./install.sh          # installs deps if needed, writes the plist, loads the agent
 ```
 
-The first run creates `~/.config/work-dir-sync/config.sh` from the template and
-stops so you can fill it in; run `./install.sh` again afterwards. Re-running it
+The first run creates `config.sh` from the template and stops so you can fill it
+in; run `./install.sh` again afterwards. Re-running it
 later is harmless: an installed, up-to-date agent is left alone (`--restart`
 forces a reload, `--no-start` sets everything up without loading).
 
@@ -46,7 +47,7 @@ Neither script ever touches the synced folders, the buckets, or the config.
 
 ## Configure
 
-Everything lives in `~/.config/work-dir-sync/config.sh`:
+Everything lives in `config.sh`:
 
 ```sh
 define_storages() {

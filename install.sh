@@ -16,8 +16,12 @@ PLIST="$DIR/$LABEL.plist"
 AGENT_LINK="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 LOG_DIR="$HOME/Library/Logs/work-dir-sync"
-CONFIG_DIR="$HOME/.config/work-dir-sync"
-CONFIG_FILE="$CONFIG_DIR/config.sh"
+# Same lookup order as sync.sh: next to the script first, then ~/.config.
+CONFIG_CANDIDATES=("$DIR/config.sh" "$HOME/.config/work-dir-sync/config.sh")
+CONFIG_FILE="${CONFIG_CANDIDATES[0]}"
+for candidate in "${CONFIG_CANDIDATES[@]}"; do
+  [ -f "$candidate" ] && { CONFIG_FILE="$candidate"; break; }
+done
 
 FORCE_RESTART=0
 START=1
@@ -52,12 +56,11 @@ done
 
 # ---------------------------------------------------------------- config file
 
-# Credentials live outside the repository.
 if [ -f "$CONFIG_FILE" ]; then
   ok "config present ($CONFIG_FILE)"
 else
   [ -f "$DIR/config.sh.example" ] || die "config.sh.example not found next to install.sh"
-  mkdir -p "$CONFIG_DIR"
+  mkdir -p "$(dirname "$CONFIG_FILE")"
   cp "$DIR/config.sh.example" "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
   echo
