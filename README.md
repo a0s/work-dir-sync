@@ -90,6 +90,7 @@ section at the top of `sync.sh` and only has to appear in `config.sh` to overrid
 
 ```sh
 ./status.sh                  # agent state, per-pair stats, freshness, trash
+./status.sh --tail           # same, redrawn in place every 5s (-i N to change)
 ./status.sh --check          # additionally compare both sides file by file
 ./status.sh --logs           # last 50 meaningful log lines, colorised
 ./status.sh --logs -n 200    # ...more of them
@@ -103,6 +104,11 @@ bash sync.sh --once          # one-off sync without the daemon
 `--logs` keeps our own events, anything rclone flagged, and the lines naming
 files that actually moved; the rest of rclone's per-cycle chatter is hidden
 behind `--raw`.
+
+`--tail` on its own is a live dashboard: it walks the cursor back over its own
+block and redraws it, so nothing that was in the terminal before is cleared and
+the last frame stays on screen after Ctrl-C. Combined with `--logs` it follows
+the log instead.
 
 To force a clean baseline for a pair, delete its marker and let the daemon
 resync: `rm ~/.local/state/work-dir-sync/resync-<pair>.done`.

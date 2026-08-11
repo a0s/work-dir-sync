@@ -4,9 +4,6 @@
 # sides, how fresh the last sync is, and the log.
 #
 #   ./status.sh                 overview
-#   ./status.sh --check         additionally compare both sides file by file
-#   ./status.sh --logs          last 50 meaningful log lines
-#   ./status.sh --logs -n 200   last 200 of them
 #   ./status.sh --logs --raw    unfiltered log (includes rclone INFO chatter)
 #   ./status.sh --logs --tail   follow the log as it grows (Ctrl-C to stop)
 
@@ -31,13 +28,15 @@ RAW=0
 FOLLOW=0
 DEEP_CHECK=0
 LINES=50
+INTERVAL=5
 while [ $# -gt 0 ]; do
   case "$1" in
     --logs)  MODE="logs" ;;
     --raw)   RAW=1 ;;
-    --tail|-f) FOLLOW=1; MODE="logs" ;;
+    --tail|-f) FOLLOW=1 ;;
     --check) DEEP_CHECK=1 ;;
     -n) shift; LINES="${1:-50}" ;;
+    --interval|-i) shift; INTERVAL="${1:-5}" ;;
     -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -115,122 +114,184 @@ row() { printf '    %-10s %s\n' "$1" "$2"; }
 
 # ------------------------------------------------------------------- overview
 
-printf '\n%swork-dir-sync%s — status\n\n' "$BOLD" "$OFF"
+# Everything the dashboard shows, printed to stdout so the live mode can
+# capture it and redraw it in place.
+render_overview() {
+  printf '\n%swork-dir-sync%s — status\n\n' "$BOLD" "$OFF"
 
-STATE="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^[[:space:]]*state = /{print $3; exit}')"
-PID="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^[[:space:]]*pid = /{print $3; exit}')"
-if [ "$STATE" = "running" ]; then
-  UPTIME="$(ps -o etime= -p "$PID" 2>/dev/null | tr -d ' ')"
-  row "agent" "${GREEN}running${OFF} (pid $PID, up ${UPTIME:-?})"
-elif [ -n "$STATE" ]; then
-  row "agent" "${YELLOW}loaded but $STATE${OFF}"
-else
-  row "agent" "${RED}not loaded${OFF} — run ./install.sh"
-fi
-
-if [ -f "$CONFIG_FILE" ]; then
-  row "config" "$CONFIG_FILE"
-else
-  row "config" "${RED}missing${OFF} (looked in ${CONFIG_CANDIDATES[*]})"
-  echo; exit 1
-fi
-
-if [ -f "$LOG_FILE" ]; then
-  row "log" "$(hsize "$(wc -c <"$LOG_FILE" | tr -d ' ')"), last entry $(ago "$(mtime "$LOG_FILE")")"
-else
-  row "log" "none yet"
-fi
-
-ERRORS_24H="$(awk -v cutoff="$(date -v-24H '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" \
-  '$0 ~ /^[0-9]{4}-/ && $0 >= cutoff && /!!!/ {n++} END{print n+0}' "$LOG_FILE" 2>/dev/null)"
-if [ "${ERRORS_24H:-0}" -gt 0 ]; then
-  last_err="$(grep '!!!' "$LOG_FILE" 2>/dev/null | tail -1 | cut -c1-19)"
-  row "errors" "${YELLOW}$ERRORS_24H in the last 24h${OFF}, latest $last_err (./status.sh --logs)"
-else
-  row "errors" "none in the last 24h"
-fi
-
-# Pull SYNC_PAIRS out of the config without running anything else in it.
-SYNC_PAIRS=()
-storage() { :; }
-define_storages() { :; }
-# shellcheck source=config.sh
-. "$CONFIG_FILE"
-
-[ "${#SYNC_PAIRS[@]}" -gt 0 ] || { printf '\n  %sno pairs configured%s\n\n' "$YELLOW" "$OFF"; exit 0; }
-
-for i in $(seq 0 $((${#SYNC_PAIRS[@]} - 1))); do
-  remote="${SYNC_PAIRS[$i]%%|*}"
-  dir="${SYNC_PAIRS[$i]#*|}"
-  key="$(pair_key "$remote")"
-
-  printf '\n  %s%s%s  <->  %s\n' "$BOLD" "$remote" "$OFF" "${dir/#$HOME/~}"
-
-  if [ -d "$dir" ]; then
-    lcount=$(find "$dir" -type f ! -name '.DS_Store' ! -name '._*' 2>/dev/null | wc -l | tr -d ' ')
-    lbytes=$(find "$dir" -type f ! -name '.DS_Store' ! -name '._*' -print0 2>/dev/null |
-             xargs -0 stat -f %z 2>/dev/null | awk '{s+=$1} END{print s+0}')
-    row "local" "$lcount files, $(hsize "$lbytes")"
+  STATE="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^[[:space:]]*state = /{print $3; exit}')"
+  PID="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^[[:space:]]*pid = /{print $3; exit}')"
+  if [ "$STATE" = "running" ]; then
+    UPTIME="$(ps -o etime= -p "$PID" 2>/dev/null | tr -d ' ')"
+    row "agent" "${GREEN}running${OFF} (pid $PID, up ${UPTIME:-?})"
+  elif [ -n "$STATE" ]; then
+    row "agent" "${YELLOW}loaded but $STATE${OFF}"
   else
-    row "local" "${YELLOW}folder does not exist yet${OFF}"
-    lcount=-1; lbytes=-1
+    row "agent" "${RED}not loaded${OFF} — run ./install.sh"
   fi
 
-  rjson="$(rclone size "$remote" --json 2>/dev/null)"
-  if [ -n "$rjson" ]; then
-    rcount=$(printf '%s' "$rjson" | sed -n 's/.*"count":\([0-9]*\).*/\1/p')
-    rbytes=$(printf '%s' "$rjson" | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p')
-    row "remote" "${rcount:-0} objects, $(hsize "${rbytes:-0}")"
+  if [ -f "$CONFIG_FILE" ]; then
+    row "config" "$CONFIG_FILE"
   else
-    row "remote" "${RED}unreachable${OFF} — check credentials/network"
-    rcount=-1; rbytes=-1
+    row "config" "${RED}missing${OFF} (looked in ${CONFIG_CANDIDATES[*]})"
+    echo; exit 1
   fi
 
-  # Freshness comes from the bisync listing, rewritten after every successful run.
-  listing="$(ls -t "$STATE_DIR/bisync/"*"$key".path1.lst 2>/dev/null | head -1)"
-  last_sync="$(mtime "${listing:-/nonexistent}")"
+  if [ -f "$LOG_FILE" ]; then
+    row "log" "$(hsize "$(wc -c <"$LOG_FILE" | tr -d ' ')"), last entry $(ago "$(mtime "$LOG_FILE")")"
+  else
+    row "log" "none yet"
+  fi
 
-  verdict=""
-  if [ "$lcount" -ge 0 ] && [ "$rcount" -ge 0 ]; then
-    if [ "$lcount" = "$rcount" ] && [ "$lbytes" = "$rbytes" ]; then
-      verdict="${GREEN}in sync${OFF}"
+  ERRORS_24H="$(awk -v cutoff="$(date -v-24H '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" \
+    '$0 ~ /^[0-9]{4}-/ && $0 >= cutoff && /!!!/ {n++} END{print n+0}' "$LOG_FILE" 2>/dev/null)"
+  if [ "${ERRORS_24H:-0}" -gt 0 ]; then
+    last_err="$(grep '!!!' "$LOG_FILE" 2>/dev/null | tail -1 | cut -c1-19)"
+    row "errors" "${YELLOW}$ERRORS_24H in the last 24h${OFF}, latest $last_err (./status.sh --logs)"
+  else
+    row "errors" "none in the last 24h"
+  fi
+
+  # Pull SYNC_PAIRS out of the config without running anything else in it.
+  SYNC_PAIRS=()
+  storage() { :; }
+  define_storages() { :; }
+  # shellcheck source=config.sh
+  . "$CONFIG_FILE"
+
+  [ "${#SYNC_PAIRS[@]}" -gt 0 ] || { printf '\n  %sno pairs configured%s\n\n' "$YELLOW" "$OFF"; exit 0; }
+
+  for i in $(seq 0 $((${#SYNC_PAIRS[@]} - 1))); do
+    remote="${SYNC_PAIRS[$i]%%|*}"
+    dir="${SYNC_PAIRS[$i]#*|}"
+    key="$(pair_key "$remote")"
+
+    printf '\n  %s%s%s  <->  %s\n' "$BOLD" "$remote" "$OFF" "${dir/#$HOME/~}"
+
+    if [ -d "$dir" ]; then
+      lcount=$(find "$dir" -type f ! -name '.DS_Store' ! -name '._*' 2>/dev/null | wc -l | tr -d ' ')
+      lbytes=$(find "$dir" -type f ! -name '.DS_Store' ! -name '._*' -print0 2>/dev/null |
+               xargs -0 stat -f %z 2>/dev/null | awk '{s+=$1} END{print s+0}')
+      row "local" "$lcount files, $(hsize "$lbytes")"
     else
-      verdict="${YELLOW}differs${OFF} ($((lcount - rcount)) files, $((lbytes - rbytes)) bytes)"
+      row "local" "${YELLOW}folder does not exist yet${OFF}"
+      lcount=-1; lbytes=-1
     fi
-  fi
 
-  baseline="${RED}no baseline${OFF} (first resync pending)"
-  [ -f "$STATE_DIR/resync-$key.done" ] && baseline="baseline ok"
-
-  row "state" "$verdict · last sync $(ago "$last_sync") · $baseline"
-
-  if [ -f "$STATE_DIR/failures-$key" ]; then
-    row "failures" "${YELLOW}$(cat "$STATE_DIR/failures-$key") consecutive$OFF"
-  fi
-
-  if [ -d "$TRASH_DIR/$key" ]; then
-    tcount=$(find "$TRASH_DIR/$key" -type d -depth 1 2>/dev/null | wc -l | tr -d ' ')
-    tbytes=$(find "$TRASH_DIR/$key" -type f -print0 2>/dev/null |
-             xargs -0 stat -f %z 2>/dev/null | awk '{s+=$1} END{print s+0}')
-    [ "$tcount" -gt 0 ] && row "trash" "$tcount snapshots, $(hsize "$tbytes") in $TRASH_DIR/$key"
-  fi
-
-  if [ "$DEEP_CHECK" = "1" ] && [ -d "$dir" ]; then
-    check_out="$(rclone check "$dir" "$remote" --filter-from "$DIR/filters.txt" --size-only 2>&1)"
-    if [ $? -eq 0 ]; then
-      row "check" "${GREEN}identical${OFF} (compared file by file)"
+    rjson="$(rclone size "$remote" --json 2>/dev/null)"
+    if [ -n "$rjson" ]; then
+      rcount=$(printf '%s' "$rjson" | sed -n 's/.*"count":\([0-9]*\).*/\1/p')
+      rbytes=$(printf '%s' "$rjson" | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p')
+      row "remote" "${rcount:-0} objects, $(hsize "${rbytes:-0}")"
     else
-      ndiff="$(printf '%s' "$check_out" | sed -n 's/.*: \([0-9]*\) differences found.*/\1/p' | tail -1)"
-      row "check" "${YELLOW}${ndiff:-some} difference(s)${OFF}"
-      # rclone phrases these as "file not in <the other side>"
-      printf '%s' "$check_out" |
-        sed -E \
-          -e 's/^.*ERROR : (.*): file not in Local file system.*/               \1 — only on remote/' \
-          -e 's/^.*ERROR : (.*): file not in S3 bucket.*/               \1 — only local/' \
-          -e 's/^.*ERROR : (.*): sizes differ.*/               \1 — sizes differ/' |
-        grep '^ ' | head -8
+      row "remote" "${RED}unreachable${OFF} — check credentials/network"
+      rcount=-1; rbytes=-1
     fi
+
+    # Freshness comes from the bisync listing, rewritten after every successful run.
+    listing="$(ls -t "$STATE_DIR/bisync/"*"$key".path1.lst 2>/dev/null | head -1)"
+    last_sync="$(mtime "${listing:-/nonexistent}")"
+
+    verdict=""
+    if [ "$lcount" -ge 0 ] && [ "$rcount" -ge 0 ]; then
+      if [ "$lcount" = "$rcount" ] && [ "$lbytes" = "$rbytes" ]; then
+        verdict="${GREEN}in sync${OFF}"
+      else
+        verdict="${YELLOW}differs${OFF} ($((lcount - rcount)) files, $((lbytes - rbytes)) bytes)"
+      fi
+    fi
+
+    baseline="${RED}no baseline${OFF} (first resync pending)"
+    [ -f "$STATE_DIR/resync-$key.done" ] && baseline="baseline ok"
+
+    row "state" "$verdict · last sync $(ago "$last_sync") · $baseline"
+
+    if [ -f "$STATE_DIR/failures-$key" ]; then
+      row "failures" "${YELLOW}$(cat "$STATE_DIR/failures-$key") consecutive$OFF"
+    fi
+
+    if [ -d "$TRASH_DIR/$key" ]; then
+      tcount=$(find "$TRASH_DIR/$key" -type d -depth 1 2>/dev/null | wc -l | tr -d ' ')
+      tbytes=$(find "$TRASH_DIR/$key" -type f -print0 2>/dev/null |
+               xargs -0 stat -f %z 2>/dev/null | awk '{s+=$1} END{print s+0}')
+      [ "$tcount" -gt 0 ] && row "trash" "$tcount snapshots, $(hsize "$tbytes") in $TRASH_DIR/$key"
+    fi
+
+    if [ "$DEEP_CHECK" = "1" ] && [ -d "$dir" ]; then
+      check_out="$(rclone check "$dir" "$remote" --filter-from "$DIR/filters.txt" --size-only 2>&1)"
+      if [ $? -eq 0 ]; then
+        row "check" "${GREEN}identical${OFF} (compared file by file)"
+      else
+        ndiff="$(printf '%s' "$check_out" | sed -n 's/.*: \([0-9]*\) differences found.*/\1/p' | tail -1)"
+        row "check" "${YELLOW}${ndiff:-some} difference(s)${OFF}"
+        # rclone phrases these as "file not in <the other side>"
+        printf '%s' "$check_out" |
+          sed -E \
+            -e 's/^.*ERROR : (.*): file not in Local file system.*/               \1 — only on remote/' \
+            -e 's/^.*ERROR : (.*): file not in S3 bucket.*/               \1 — only local/' \
+            -e 's/^.*ERROR : (.*): sizes differ.*/               \1 — sizes differ/' |
+          grep '^ ' | head -8
+      fi
+    fi
+  done
+
+}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  printf '\n%swork-dir-sync%s — status\n\n' "$BOLD" "$OFF"
+  printf '    %-10s %smissing%s (looked in %s)\n\n' "config" "$RED" "$OFF" "${CONFIG_CANDIDATES[*]}"
+  exit 1
+fi
+
+# How many terminal rows a block of text occupies, accounting for wrapping and
+# ignoring the colour escapes, so the live mode knows how far to move back up.
+visual_lines() {
+  local width="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+  awk -v w="$width" '{
+    gsub(/\033\[[0-9;]*m/, "")
+    n = length($0); if (n == 0) n = 1
+    total += int((n - 1) / w) + 1
+  } END { print total + 0 }'
+}
+
+if [ "$FOLLOW" != "1" ]; then
+  render_overview
+  printf '\n  %s./status.sh --tail   ./status.sh --logs   ./install.sh --restart%s\n\n' "$DIM" "$OFF"
+  exit 0
+fi
+
+# ------------------------------------------------------------------- live mode
+#
+# The block is redrawn in place by walking the cursor back up over it — no
+# clear, no alternate screen, so whatever was in the scrollback before stays
+# untouched and the last frame remains on screen after Ctrl-C.
+
+cleanup_live() { printf '\033[?25h'; echo; exit 0; }
+trap cleanup_live INT TERM
+
+printf '\033[?25l'   # hide the cursor while redrawing
+prev=0
+
+while :; do
+  frame="$(render_overview)"
+  frame="$frame
+  ${DIM}refreshing every ${INTERVAL}s — Ctrl-C to stop${OFF}"
+  now=$(printf '%s\n' "$frame" | visual_lines)
+
+  [ "$prev" -gt 0 ] && printf '\033[%dA' "$prev"
+
+  printf '%s\n' "$frame" | while IFS= read -r line; do
+    printf '\033[2K%s\n' "$line"
+  done
+
+  # a shorter frame than last time would leave stale rows behind
+  if [ "$prev" -gt "$now" ]; then
+    i=$now
+    while [ "$i" -lt "$prev" ]; do printf '\033[2K\n'; i=$((i + 1)); done
+    printf '\033[%dA' $((prev - now))
+    now=$prev
   fi
+
+  prev=$now
+  sleep "$INTERVAL"
 done
-
-printf '\n  %s./status.sh --logs   ./status.sh --logs --tail   ./install.sh --restart%s\n\n' "$DIM" "$OFF"
