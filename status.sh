@@ -6,6 +6,10 @@
 #   ./status.sh                 overview, printed once
 #   ./status.sh --tail          live overview, redrawn in place every 5s
 #   ./status.sh --tail -i 10    ...at a different interval
+#   ./status.sh --resync-force [filter]
+#                               drop the baseline and force a full resync of
+#                               every pair (or those matching filter) — the
+#                               newer file wins, nothing is deleted
 #   ./status.sh --live          query the bucket directly instead of using the
 #                               last bisync listing (costs class A requests)
 #   ./status.sh --check         additionally compare both sides file by file
@@ -35,6 +39,9 @@ RAW=0
 FOLLOW=0
 DEEP_CHECK=0
 LIVE=0
+RESYNC_FORCE=0
+ASSUME_YES=0
+PAIR_FILTER=""
 LINES=50
 INTERVAL=5
 while [ $# -gt 0 ]; do
@@ -44,10 +51,13 @@ while [ $# -gt 0 ]; do
     --tail|-f) FOLLOW=1 ;;
     --check) DEEP_CHECK=1 ;;
     --live)  LIVE=1 ;;
+    --resync-force) RESYNC_FORCE=1 ;;
+    --yes|-y) ASSUME_YES=1 ;;
     -n) shift; LINES="${1:-50}" ;;
     --interval|-i) shift; INTERVAL="${1:-5}" ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *)  PAIR_FILTER="$1" ;;
   esac
   shift
 done
@@ -144,6 +154,67 @@ bisync_name() {
 }
 row() { printf '    %-10s %s\n' "$1" "$2"; }
 
+
+# ------------------------------------------------------------- resync-force
+#
+# Throws away the baseline so the next run rebuilds it with
+# `bisync --resync --resync-mode newer`: both sides end up holding the union of
+# their files, the newer version wins a name clash, and nothing is deleted.
+# Use it after the two sides drifted apart, or when bisync refuses to continue.
+
+if [ "$RESYNC_FORCE" = "1" ]; then
+  [ -f "$CONFIG_FILE" ] || { echo "no config at $CONFIG_FILE" >&2; exit 1; }
+  SYNC_PAIRS=()
+  storage() { :; }
+  define_storages() { :; }
+  . "$CONFIG_FILE"
+
+  targets=""
+  for i in $(seq 0 $((${#SYNC_PAIRS[@]} - 1))); do
+    case "${SYNC_PAIRS[$i]}" in
+      *"$PAIR_FILTER"*) targets="$targets $i" ;;
+    esac
+  done
+  [ -n "$targets" ] || { echo "no pairs match '${PAIR_FILTER}'" >&2; exit 1; }
+
+  printf '\n%sForcing a full resync of:%s\n' "$BOLD" "$OFF"
+  for i in $targets; do printf '    %s\n' "${SYNC_PAIRS[$i]}"; done
+  printf '\n  Both sides keep every file they have; on a name clash the newer one\n'
+  printf '  wins and the loser is kept as <name>.conflict1. Nothing is deleted.\n\n'
+
+  if [ "$ASSUME_YES" != "1" ]; then
+    if [ -t 0 ]; then
+      printf '  Proceed? [y/N] '
+      read -r answer
+      case "$answer" in y|Y|yes|YES) : ;; *) echo "  aborted"; exit 1 ;; esac
+    else
+      echo "  refusing to run non-interactively without --yes" >&2
+      exit 1
+    fi
+  fi
+
+  for i in $targets; do
+    remote="${SYNC_PAIRS[$i]%%|*}"
+    dir="${SYNC_PAIRS[$i]#*|}"
+    key="$(pair_key "$remote" "$dir")"
+    rm -f "$STATE_DIR/resync-$key.done" "$STATE_DIR/failures-$key" \
+          "$STATE_DIR/resync-$key.last" "$STATE_DIR/marker-$key"
+    printf '  %s✓%s baseline dropped for %s\n' "$GREEN" "$OFF" "$remote"
+
+    # nudge the running worker so it picks this up now rather than on its timer
+    fifo="$STATE_DIR/events-$key.fifo"
+    if [ -p "$fifo" ] && pgrep -f "bash .*sync\.sh" >/dev/null 2>&1; then
+      printf 'LOCAL\n' >"$fifo" 2>/dev/null &
+      sleep 1
+      printf '    the running daemon was nudged — watch ./status.sh --logs\n'
+    else
+      printf '    daemon is not running; the resync happens when it starts\n'
+    fi
+  done
+  echo
+  exit 0
+fi
+
 # ------------------------------------------------------------------- overview
 
 # Everything the dashboard shows, printed to stdout so the live mode can
@@ -182,6 +253,16 @@ render_overview() {
     row "errors" "${YELLOW}$ERRORS_24H in the last 24h${OFF}, latest $last_err (./status.sh --logs)"
   else
     row "errors" "none in the last 24h"
+  fi
+
+  DIED_24H="$(awk -v cutoff="$(date -v-24H '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" \
+    '$0 ~ /^[0-9]{4}-/ && $0 >= cutoff && /worker .* died/ {n++} END{print n+0}' "$LOG_FILE" 2>/dev/null)"
+  if [ "${DIED_24H:-0}" -gt 0 ]; then
+    # without the timestamp a long-fixed crash looks like an ongoing fire
+    last_died="$(grep 'worker .* died' "$LOG_FILE" 2>/dev/null | tail -1 | cut -c1-19)"
+    row "workers" "${RED}$DIED_24H restarts after a crash${OFF} in the last 24h, latest $last_died"
+    grep -E 'line [0-9]+:|unbound variable|command not found' "$LOG_FILE" 2>/dev/null |
+      tail -2 | sed 's/^/               /'
   fi
 
   # Pull SYNC_PAIRS out of the config without running anything else in it.
@@ -342,14 +423,22 @@ if [ ! -f "$CONFIG_FILE" ]; then
   exit 1
 fi
 
-# Width of the real terminal — $COLUMNS is not exported and tput inside a
-# command substitution reports 80, which is what made the redraw drift.
+# Real terminal geometry — $COLUMNS/$LINES are not exported and tput inside a
+# command substitution reports 80x24, which is what made the redraw drift.
 term_width() {
   local w
   w="$(stty size </dev/tty 2>/dev/null | awk '{print $2}')"
   [ -n "$w" ] && [ "$w" -gt 0 ] 2>/dev/null || w="$(tput cols </dev/tty 2>/dev/null)"
   [ -n "$w" ] && [ "$w" -gt 0 ] 2>/dev/null || w=80
   printf '%s' "$w"
+}
+
+term_height() {
+  local h
+  h="$(stty size </dev/tty 2>/dev/null | awk '{print $1}')"
+  [ -n "$h" ] && [ "$h" -gt 0 ] 2>/dev/null || h="$(tput lines </dev/tty 2>/dev/null)"
+  [ -n "$h" ] && [ "$h" -gt 0 ] 2>/dev/null || h=24
+  printf '%s' "$h"
 }
 
 # Cut every line to the terminal width, counting only visible characters and
@@ -403,14 +492,25 @@ prev_width=0
 
 while :; do
   width="$(term_width)"
+  geometry="${width}x$(term_height)"
   # after a resize the old geometry is meaningless — start a fresh block below
-  [ "$width" != "$prev_width" ] && prev=0
-  prev_width="$width"
+  [ "$geometry" != "$prev_width" ] && prev=0
+  prev_width="$geometry"
 
   frame="$(render_overview)
   ${DIM}refreshing every ${INTERVAL}s — Ctrl-C to stop${OFF}"
   frame="$(printf '%s\n' "$frame" | fit_width "$width")"
   now="$(printf '%s\n' "$frame" | wc -l | tr -d ' ')"
+
+  # A frame taller than the window makes the terminal scroll, and then walking
+  # the cursor back up lands above the frame and eats the scrollback. Keep it
+  # one line shorter than the window instead.
+  height="$(term_height)"
+  if [ "$now" -ge "$height" ]; then
+    frame="$(printf '%s\n' "$frame" | head -n $((height - 2)))
+${DIM}  … $((now - height + 2)) more lines — use ./status.sh without --tail${OFF}"
+    now=$((height - 1))
+  fi
 
   [ "$prev" -gt 0 ] && printf '\033[%dA' "$prev"
 

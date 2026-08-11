@@ -49,6 +49,11 @@ RUN_ONCE=0
 
 mkdir -p "$STATE_DIR" "$BISYNC_WORKDIR" "$LOG_DIR"
 
+# Everything the shell itself complains about (unbound variables, failed
+# commands) belongs in the log people actually read, not only in launchd's
+# stderr file.
+exec 2>>"$LOG_FILE"
+
 # --------------------------------------------------------------- configuration
 
 # Defaults for everything config.sh may override. config.sh itself only has to
