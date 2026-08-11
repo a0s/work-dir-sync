@@ -101,7 +101,7 @@ fi
 
 warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 
-SFTP_KEYS="$(
+(
   storage() {
     local kv type="" key="" pass=""
     shift
@@ -118,7 +118,7 @@ SFTP_KEYS="$(
   define_storages() { :; }
   . "$CONFIG_FILE"
   define_storages
-)"
+) |
 
 while IFS= read -r keyfile; do
   [ -n "$keyfile" ] || continue
@@ -131,7 +131,7 @@ while IFS= read -r keyfile; do
     warn "SSH key $keyfile needs a passphrase — launchd cannot type one."
     warn "  Add key_file_pass=<passphrase> to that storage, or use a bare key."
   fi
-done <<<"$SFTP_KEYS"
+done
 
 [ -f "$DIR/filters.txt" ] || die "filters.txt is missing"
 mkdir -p "$LOG_DIR"
