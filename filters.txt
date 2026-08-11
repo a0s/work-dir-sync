@@ -22,6 +22,8 @@
 - \#*\#
 
 # --- internal ---
+# the change marker the daemon publishes; syncing it back would be a loop
+- _wds/**
 - .rclone-bisync-*/**
 - *.conflict[0-9]*
 

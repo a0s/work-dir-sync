@@ -60,9 +60,23 @@ SYNC_PAIRS=()
 # Remote backends, declared with `storage <name> type=<backend> key=value ...`.
 define_storages() { :; }
 
-# How often to poll the remote side for changes made elsewhere, seconds.
-# (Local changes are detected instantly via FSEvents; polling is for the remote.)
+# How often to check the remote change marker, seconds. This is one small GET
+# (class B, 10M free per month), not a bucket listing, so it can be aggressive.
+# Local changes are detected instantly via FSEvents; this is for the other machine.
 POLL_INTERVAL=60
+
+# Never start two syncs of the same pair closer together than this, seconds —
+# a burst of local writes (npm install, a build) must not mean a run per file.
+MIN_SYNC_INTERVAL=60
+
+# Sync unconditionally at least this often, seconds. The safety net for events
+# FSEvents dropped, for writes made while the daemon was down, and for anything
+# written to the bucket by something other than this daemon.
+FULL_SCAN_INTERVAL=86400
+
+# Object holding "<epoch> <machine-id>" of the last publication. Must be
+# excluded in filters.txt, otherwise it syncs itself back and forth.
+MARKER_PATH="_wds/HEAD"
 
 # Quiet period after a local event before syncing, seconds — coalesces bursts.
 DEBOUNCE_SECONDS=3
@@ -165,7 +179,6 @@ acquire_lock() {
 
 # ------------------------------------------------------------------- watchers
 
-FIFO="$STATE_DIR/events.fifo"
 WATCHER_PIDS=""
 
 kill_watchers() {
@@ -177,23 +190,19 @@ kill_watchers() {
   WATCHER_PIDS=""
 }
 
-start_watchers() {
-  rm -f "$FIFO"
-  mkfifo "$FIFO" || { log "cannot create FIFO $FIFO"; exit 1; }
-  exec 3<>"$FIFO"
+# Feeds one pair's local events into its own FIFO, read by that pair's worker.
+start_pair_watcher() {
+  local idx="$1" dir="$2" fifo="$3"
+  (
+    fswatch -o -r --latency 1 "$dir" 2>/dev/null | while read -r _; do
+      printf 'LOCAL\n' >"$fifo"
+    done
+  ) &
+  WATCHER_PIDS="$WATCHER_PIDS $!"
+}
 
-  local i dir
-  for i in $(seq 0 $((${#SYNC_PAIRS[@]} - 1))); do
-    dir="${SYNC_PAIRS[$i]#*|}"
-    (
-      fswatch -o -r --latency 1 "$dir" 2>/dev/null | while read -r _; do
-        printf 'P%s\n' "$i" >"$FIFO"
-      done
-    ) &
-    WATCHER_PIDS="$WATCHER_PIDS $!"
-  done
-
-  # watch the script and the config (their directories — editors replace inodes)
+# Watches the script and the config so the supervisor can re-exec on edits.
+start_self_watcher() {
   local watch_dir seen=""
   for watch_dir in "$SCRIPT_DIR" "$CONFIG_DIR" "$(dirname "${CONFIG_CANDIDATES[1]}")"; do
     [ -d "$watch_dir" ] || continue
@@ -201,13 +210,11 @@ start_watchers() {
     seen="$seen|$watch_dir|"
     (
       fswatch -o --latency 1 "$watch_dir" 2>/dev/null | while read -r _; do
-        printf 'SELF\n' >"$FIFO"
+        printf 'SELF\n' >"$SELF_FIFO"
       done
     ) &
     WATCHER_PIDS="$WATCHER_PIDS $!"
   done
-
-  log "watchers started (PIDs:$WATCHER_PIDS)"
 }
 
 # ------------------------------------------------------------------ self-reload
@@ -228,9 +235,10 @@ maybe_restart() {
 
   if bash -n "$SCRIPT_PATH" 2>>"$LOG_FILE" && bash -n "$CONFIG_FILE" 2>>"$LOG_FILE"; then
     log "=== script/config changed, syntax OK — restarting ==="
+    stop_workers
     kill_watchers
     exec 3>&-
-    rm -f "$FIFO"
+    rm -f "$SELF_FIFO" "$STATE_DIR"/events-*.fifo
     exec /bin/bash "$SCRIPT_PATH"
   else
     if [ "$BAD_HASH" != "$now" ]; then
@@ -276,11 +284,13 @@ apply_storages() {
 
 # --------------------------------------------------------------------- bisync
 
-pair_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+# Identifies a pair by BOTH sides: pointing a bucket at a different folder makes
+# the old bisync state meaningless, and the key has to change with it.
+pair_key() { printf '%s__%s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '_'; }
 
 run_bisync() {
   local remote="$1" dir="$2"
-  local key; key="$(pair_key "$remote")"
+  local key; key="$(pair_key "$remote" "$dir")"
   local marker="$STATE_DIR/resync-$key.done"
   local cooldown_file="$STATE_DIR/resync-$key.last"
   local fail_file="$STATE_DIR/failures-$key"
@@ -292,6 +302,7 @@ run_bisync() {
 
   local common=(
     --filters-file "$FILTERS_FILE"
+    --exclude "${MARKER_PATH%%/*}/**"
     --workdir "$BISYNC_WORKDIR"
     --create-empty-src-dirs
     --compare size,modtime
@@ -521,11 +532,118 @@ validate_pairs() {
   return $ok
 }
 
+
+# --------------------------------------------------------------- change marker
+#
+# Polling the bucket with a full listing costs ~one class A request per 1000
+# objects, every cycle. Instead each agent publishes a tiny marker object after
+# it changes anything, and the others only read that: a single class B GET,
+# whose free allowance is ten times larger. A full listing then happens only
+# when the marker actually moved.
+
+machine_id() {
+  local f="$STATE_DIR/machine-id"
+  if [ ! -s "$f" ]; then
+    { uuidgen 2>/dev/null || date +%s%N; } | tr -d '\n' >"$f"
+  fi
+  cat "$f"
+}
+
+# Did somebody else publish since we last looked?
+remote_marker_changed() {
+  local remote="$1" key="$2"
+  local seen_file="$STATE_DIR/marker-$key"
+  local cur
+  # --s3-no-head-object: skip the HEAD rclone would otherwise do before the GET,
+  # turning the check into exactly one class B request
+  cur="$(rclone cat "$remote/$MARKER_PATH" --s3-no-head-object $EXTRA_RCLONE_FLAGS 2>/dev/null)"
+  [ -n "$cur" ] || return 1                      # nobody has published yet
+  case "$cur" in *"$MACHINE_ID") return 1 ;; esac  # our own publication
+  [ "$cur" = "$(cat "$seen_file" 2>/dev/null)" ] && return 1
+  printf '%s' "$cur" >"$seen_file"
+  return 0
+}
+
+publish_marker() {
+  local remote="$1" key="$2"
+  local val="$(date +%s) $MACHINE_ID"
+  printf '%s' "$val" | rclone rcat -q "$remote/$MARKER_PATH" $EXTRA_RCLONE_FLAGS 2>/dev/null
+  printf '%s' "$val" >"$STATE_DIR/marker-$key"
+}
+
+# Did the last bisync run actually move anything?
+run_touched_anything() {
+  grep -qE ': (Copied|Deleted|Moved|Updated|Renamed)' "$STATE_DIR/last-run-$1.log" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- pair worker
+#
+# One worker process per pair. Pairs used to share a single loop, so a first
+# upload of tens of thousands of files starved every other pair for hours.
+
+pair_worker() {
+  local idx="$1"
+  local remote="${SYNC_PAIRS[$idx]%%|*}"
+  local dir="${SYNC_PAIRS[$idx]#*|}"
+  local key; key="$(pair_key "$remote" "$dir")"
+  local fifo="$STATE_DIR/events-$key.fifo"
+
+  mkdir -p "$dir"
+  rm -f "$fifo"; mkfifo "$fifo" || { log "[$remote] cannot create $fifo"; return 1; }
+  exec 3<>"$fifo"
+  WATCHER_PIDS=""
+  start_pair_watcher "$idx" "$dir" "$fifo"
+  log "[$remote] worker started, watching $dir"
+
+  local last_sync=0 last_full=0 pending=1 reason now wait
+
+  while :; do
+    now="$(date +%s)"
+    reason=""
+    if [ "$pending" = "1" ]; then
+      reason="local changes"
+    elif remote_marker_changed "$remote" "$key"; then
+      reason="remote update"
+    elif [ $((now - last_full)) -ge "$FULL_SCAN_INTERVAL" ]; then
+      reason="periodic full scan"
+    fi
+
+    if [ -n "$reason" ]; then
+      # never hammer: a burst of local writes must not mean a run per burst
+      wait=$((MIN_SYNC_INTERVAL - (now - last_sync)))
+      if [ "$wait" -gt 0 ] && [ "$last_sync" -gt 0 ]; then
+        sleep "$wait"
+      fi
+      log "[$remote] syncing ($reason)"
+      pending=0
+      if run_bisync "$remote" "$dir"; then
+        if run_touched_anything "$key"; then
+          publish_marker "$remote" "$key"
+          log "[$remote] done, marker published"
+        fi
+      fi
+      last_sync="$(date +%s)"
+      [ "$reason" = "periodic full scan" ] && last_full="$last_sync"
+      [ "$last_full" -eq 0 ] && last_full="$last_sync"
+      # discard the events our own writes just produced
+      while read -r -u 3 -t 1 _; do :; done
+      continue
+    fi
+
+    # nothing to do — wait for a local event or for the next marker check
+    if read -r -u 3 -t "$POLL_INTERVAL" _; then
+      pending=1
+      while read -r -u 3 -t "$DEBOUNCE_SECONDS" _; do :; done
+    fi
+  done
+}
+
 # ----------------------------------------------------------------------- main
 
 cleanup() {
+  stop_workers 2>/dev/null
   kill_watchers
-  rm -f "$FIFO"
+  rm -f "$SELF_FIFO" "$STATE_DIR"/events-*.fifo
   if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
     rm -rf "$LOCK_DIR"
   fi
@@ -575,45 +693,56 @@ for i in $(seq 0 $((${#SYNC_PAIRS[@]} - 1))); do
   mkdir -p "${SYNC_PAIRS[$i]#*|}"
 done
 
-start_watchers
-sync_pairs ALL
+MACHINE_ID="$(machine_id)"
+log "machine id: $MACHINE_ID"
 
+SELF_FIFO="$STATE_DIR/events-self.fifo"
+rm -f "$SELF_FIFO"; mkfifo "$SELF_FIFO" || { log "cannot create $SELF_FIFO"; exit 1; }
+exec 4<>"$SELF_FIFO"
+start_self_watcher
+
+WORKER_PIDS=""
+stop_workers() {
+  local p
+  for p in $WORKER_PIDS; do
+    pkill -P "$p" 2>/dev/null
+    kill "$p" 2>/dev/null
+  done
+  WORKER_PIDS=""
+}
+
+spawn_workers() {
+  local i
+  WORKER_PIDS=""
+  for i in $(seq 0 $((${#SYNC_PAIRS[@]} - 1))); do
+    pair_worker "$i" &
+    WORKER_PIDS="$WORKER_PIDS $!"
+  done
+  log "workers:$WORKER_PIDS"
+}
+
+spawn_workers
+
+# The supervisor itself does no syncing: it re-execs on edits and restarts any
+# worker that died, so one failing pair cannot take the others down.
 while :; do
   rotate_log
-
-  pending=""
-  self_event=0
-
-  if read -r -u 3 -t "$POLL_INTERVAL" ev; then
-    # a local event arrived — collect the whole burst for DEBOUNCE_SECONDS
-    guard=0
-    while :; do
-      case "$ev" in
-        SELF) self_event=1 ;;
-        P*)
-          idx="${ev#P}"
-          case " $pending " in *" $idx "*) : ;; *) pending="$pending $idx" ;; esac
-          ;;
-      esac
-      guard=$((guard + 1))
-      [ "$guard" -gt 200 ] && break
-      read -r -u 3 -t "$DEBOUNCE_SECONDS" ev || break
-    done
-  else
-    # poll timeout — check both sides of every pair
-    pending="ALL"
+  if read -r -u 4 -t 30 _; then
+    while read -r -u 4 -t 2 _; do :; done
   fi
-
-  [ "$self_event" = "1" ] && maybe_restart
   maybe_restart
 
-  if [ -n "$pending" ]; then
-    if [ "$pending" = "ALL" ]; then
-      sync_pairs ALL
+  alive=""
+  for p in $WORKER_PIDS; do
+    if kill -0 "$p" 2>/dev/null; then
+      alive="$alive $p"
     else
-      sync_pairs "$pending"
+      log "!!! worker $p died — restarting all workers"
+      stop_workers
+      spawn_workers
+      alive="$WORKER_PIDS"
+      break
     fi
-    # drop the events caused by rclone itself (files it just wrote locally)
-    while read -r -u 3 -t 1 _; do :; done
-  fi
+  done
+  WORKER_PIDS="$alive"
 done
