@@ -450,6 +450,16 @@ run_bisync() {
 
   # First run for this pair: build the baseline listings.
   if [ ! -f "$marker" ]; then
+    # bisync expects both roots to exist before it starts. In particular, its
+    # --create-empty-src-dirs flag only preserves directories during copying;
+    # it does not create a missing remote root and the first run otherwise
+    # aborts with "directory not found". `rclone mkdir` is idempotent across
+    # backends, so this is also safe when another machine created it first.
+    if ! rclone mkdir "$remote" $EXTRA_RCLONE_FLAGS >/dev/null; then
+      log "!!! could not create remote root for $remote"
+      notify "remote directory creation failed: $remote"
+      return 1
+    fi
     log ">>> initial resync: $dir <-> $remote"
     rclone bisync "$dir" "$remote" --resync --resync-mode newer "${common[@]}"
     local rrc=$?
