@@ -16,6 +16,7 @@ Continuous **two-way** sync between local folders and remote object storage
 | --- | --- |
 | `sync.sh` | the daemon (engine, no settings inside) |
 | `install.sh` / `uninstall.sh` | register / unregister the launchd agent (both idempotent) |
+| `status.sh` | what it is doing right now, plus the log |
 | `config.sh` | storages, pairs and knobs — **credentials, gitignored** |
 | `config.sh.example` | template for `config.sh` |
 | `filters.txt` | rclone filters shared by both sides |
@@ -88,11 +89,20 @@ section at the top of `sync.sh` and only has to appear in `config.sh` to overrid
 ## Operate
 
 ```sh
-tail -f ~/Library/Logs/work-dir-sync/sync.log     # what it is doing
-bash sync.sh --once                                # one-off sync, no daemon
-./install.sh --restart                             # force a reload
-./uninstall.sh                                     # stop & unload
+./status.sh                  # agent state, per-pair stats, freshness, trash
+./status.sh --check          # additionally compare both sides file by file
+./status.sh --logs           # last 50 meaningful log lines, colorised
+./status.sh --logs -n 200    # ...more of them
+./status.sh --logs --raw     # unfiltered, including rclone INFO chatter
+./status.sh --logs --tail    # follow live
+bash sync.sh --once          # one-off sync without the daemon
+./install.sh --restart       # force a reload
+./uninstall.sh               # stop & unload
 ```
+
+`--logs` keeps our own events, anything rclone flagged, and the lines naming
+files that actually moved; the rest of rclone's per-cycle chatter is hidden
+behind `--raw`.
 
 To force a clean baseline for a pair, delete its marker and let the daemon
 resync: `rm ~/.local/state/work-dir-sync/resync-<pair>.done`.
